@@ -37,6 +37,8 @@ class BinanceDataStreamer:
         # Per-event-type counters so a dead stream is immediately visible.
         self.event_counts: dict = {}
         self.heartbeat_task: Optional[asyncio.Task] = None
+        # DIAGNOSTIC: which stream names we've already logged a first message for.
+        self._seen_streams: set = set()
 
         # Symbols Binance actually lists as tradable USD-M perpetuals.
         self.valid_symbols: Set[str] = set()
@@ -123,6 +125,13 @@ class BinanceDataStreamer:
             data = orjson.loads(message)
             # Combined-stream endpoint wraps every event: {"stream":.., "data":..}
             if 'stream' in data and 'data' in data:
+                stream_name = data.get('stream')
+                # DIAGNOSTIC: log the first message seen on each unique stream so
+                # we can prove exactly which streams Binance actually delivers.
+                if stream_name and stream_name not in self._seen_streams:
+                    self._seen_streams.add(stream_name)
+                    logger.info(f"[diag] FIRST message on stream '{stream_name}': "
+                                f"{str(data.get('data'))[:180]}")
                 data = data['data']
             if 'e' not in data:
                 # Not a market event. This is where Binance returns SUBSCRIBE
