@@ -7,6 +7,7 @@ from collections import deque
 from typing import Dict, Any
 
 import config
+import indicators
 
 # Setup basic asynchronous-friendly logging
 logging.basicConfig(
@@ -23,21 +24,38 @@ class AlphaGenerator:
         # State: CVD rolling queues for each symbol
         # { "BTCUSDT": deque([(timestamp, buy_vol, sell_vol), ...]) }
         self.cvd_state: Dict[str, deque] = {s.upper(): deque() for s in config.SYMBOLS}
-        
+
         # State: Latest orderbook imbalance for each symbol
         # { "BTCUSDT": imbalance_ratio }
         self.ob_state: Dict[str, float] = {s.upper(): 0.5 for s in config.SYMBOLS}
-        
+
+        # State: rolling (timestamp_ms, price) per symbol for liquidity levels
+        # { "BTCUSDT": deque([(ts, price), ...]) }
+        self.price_state: Dict[str, deque] = {s.upper(): deque() for s in config.SYMBOLS}
+
         self.window_1m = 60 * 1000  # ms
         self.window_5m = 5 * 60 * 1000  # ms
+
+        # Liquidity-level windows (ms)
+        self.swing_lookback = int(config.SWING_LOOKBACK_SEC * 1000)
+        self.sweep_reaction = int(config.SWEEP_REACTION_SEC * 1000)
+        self.range_window = int(config.RANGE_WINDOW_SEC * 1000)
 
     async def initialize(self):
         """Initialize Redis connection and pubsub."""
         logger.info(f"Connecting to Redis at {config.REDIS_URL}")
         self.redis_client = redis.from_url(config.REDIS_URL, decode_responses=False)
         self.pubsub = self.redis_client.pubsub()
-        await self.pubsub.psubscribe("market:trades:*", "market:depth:*")
-        logger.info("Subscribed to market data channels successfully.")
+        await self.pubsub.psubscribe("market:trades:*", "market:depth:*", "control:dynamic_symbols")
+        logger.info("Subscribed to market data + dynamic-symbol channels.")
+
+    def _ensure_symbol(self, sym_upper: str):
+        """Start tracking a newly discovered symbol so its features get computed."""
+        if sym_upper not in self.cvd_state:
+            self.cvd_state[sym_upper] = deque()
+            self.ob_state[sym_upper] = 0.5
+            self.price_state[sym_upper] = deque()
+            logger.info(f"Now tracking dynamic symbol: {sym_upper}")
 
     async def cleanup(self):
         """Cleanup resources."""
@@ -54,19 +72,22 @@ class AlphaGenerator:
         # If 'm' is False, it's a buyer-initiated trade (buy order matched maker ask).
         try:
             qty = float(data['q'])
+            price = float(data['p'])
             ts = int(data['T'])
             is_buyer_maker = bool(data['m'])
-            
+
             buy_vol = 0.0
             sell_vol = 0.0
-            
+
             if is_buyer_maker:
                 sell_vol = qty
             else:
                 buy_vol = qty
-                
+
             if symbol in self.cvd_state:
                 self.cvd_state[symbol].append((ts, buy_vol, sell_vol))
+            if symbol in self.price_state:
+                self.price_state[symbol].append((ts, price))
         except (KeyError, ValueError) as e:
             logger.error(f"Error processing trade data for {symbol}: {e}")
 
@@ -101,10 +122,15 @@ class AlphaGenerator:
                     if channel.startswith("market:trades:"):
                         symbol = channel.split(":")[-1]
                         self._process_trade(symbol, data)
-                        
+
                     elif channel.startswith("market:depth:"):
                         symbol = channel.split(":")[-1]
                         self._process_depth(symbol, data)
+
+                    elif channel == "control:dynamic_symbols":
+                        # Macro agent discovered new satellite coins -> track them.
+                        for s in data:
+                            self._ensure_symbol(str(s).upper())
                 else:
                     await asyncio.sleep(0.01)
             except asyncio.CancelledError:
@@ -136,15 +162,82 @@ class AlphaGenerator:
                 
         return cvd_1m, cvd_5m
 
+    def _compute_levels(self, symbol: str, current_ts: int) -> dict:
+        """Track liquidity levels and detect stop-hunt sweeps.
+
+        A "sweep low" = price pierced BELOW the established swing low (where
+        stops rest) within the recent reaction window, then reclaimed back
+        above it. That is the footprint of a stop hunt; a reversal long often
+        follows. "sweep high" is the mirror image for shorts.
+
+        Returns the levels plus a 1-minute range used to size the stop beyond
+        the sweep wick (so our stop is NOT sitting on the hunted level).
+        """
+        dq = self.price_state.get(symbol)
+        if not dq:
+            return {}
+
+        # Drop anything older than the lookback window.
+        while dq and current_ts - dq[0][0] > self.swing_lookback:
+            dq.popleft()
+        if len(dq) < 5:
+            return {}
+
+        reaction_cutoff = current_ts - self.sweep_reaction
+        range_cutoff = current_ts - self.range_window
+
+        established_prices = [p for ts, p in dq if ts < reaction_cutoff]
+        recent_prices = [p for ts, p in dq if ts >= reaction_cutoff]
+        range_prices = [p for ts, p in dq if ts >= range_cutoff]
+
+        if not established_prices or not recent_prices:
+            return {}
+
+        last_price = dq[-1][1]
+        swing_high = max(established_prices)   # liquidity resting above
+        swing_low = min(established_prices)    # liquidity resting below
+        recent_min = min(recent_prices)
+        recent_max = max(recent_prices)
+        range_1m = (max(range_prices) - min(range_prices)) if range_prices else 0.0
+
+        # Sweep detection: pierced the level, then closed back inside it.
+        sweep_low = recent_min < swing_low and last_price > swing_low
+        sweep_high = recent_max > swing_high and last_price < swing_high
+
+        # Indicator layers: resample the trade stream to 5s closes, then derive
+        # trend (EMA fast/slow), exhaustion (RSI) and volatility (ATR).
+        start_ts = current_ts - self.swing_lookback
+        closes = indicators.resample_closes(list(dq), 5000, start_ts, current_ts)
+        ema_fast = indicators.ema(closes, 12)
+        ema_slow = indicators.ema(closes, 26)
+        rsi_val = indicators.rsi(closes, 14)
+        atr_val = indicators.atr_from_closes(closes, 14)
+
+        return {
+            "symbol": symbol,
+            "last_price": round(last_price, 8),
+            "swing_high": round(swing_high, 8),
+            "swing_low": round(swing_low, 8),
+            "recent_min": round(recent_min, 8),
+            "recent_max": round(recent_max, 8),
+            "range_1m": round(range_1m, 8),
+            "sweep_low": sweep_low,
+            "sweep_high": sweep_high,
+            "ema_fast": round(ema_fast, 8),
+            "ema_slow": round(ema_slow, 8),
+            "rsi": round(rsi_val, 2),
+            "atr": round(atr_val, 8),
+        }
+
     async def publish_features(self):
         """Periodically calculate and publish features to Redis."""
         while True:
             try:
                 current_ts = int(time.time() * 1000)
-                
-                for symbol in config.SYMBOLS:
-                    sym_upper = symbol.upper()
-                    
+
+                # Loop over ALL tracked symbols (core + dynamic), not just config.
+                for sym_upper in list(self.cvd_state.keys()):
+
                     # 1. Calculate and publish CVD
                     cvd_1m, cvd_5m = self._calculate_cvd(sym_upper, current_ts)
                     cvd_payload = {
@@ -169,7 +262,16 @@ class AlphaGenerator:
                         f"features:imbalance:{sym_upper}",
                         orjson.dumps(imb_payload)
                     )
-                    
+
+                    # 3. Compute & publish liquidity levels + sweep flags
+                    levels = self._compute_levels(sym_upper, current_ts)
+                    if levels:
+                        levels["timestamp"] = current_ts
+                        await self.redis_client.publish(
+                            f"features:levels:{sym_upper}",
+                            orjson.dumps(levels)
+                        )
+
             except Exception as e:
                 logger.error(f"Error publishing features: {e}")
                 

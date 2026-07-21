@@ -1,14 +1,19 @@
 import asyncio
 import logging
+import os
 import time
 import orjson
 import redis.asyncio as redis
 from typing import Dict, Any, Optional
 from pydantic import BaseModel, Field
-import google.generativeai as genai
 from supabase import create_client, Client
 
 import config
+import signal_engine
+
+# Only dispatch signals whose conviction clears this floor. This is the second
+# gate on top of signal_engine's own entry threshold.
+MIN_CONFIDENCE = float(os.getenv("MIN_SIGNAL_CONFIDENCE", "0.55"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,49 +21,55 @@ logging.basicConfig(
 )
 logger = logging.getLogger("AgentOrchestrator")
 
-# Configure Gemini
-if not config.GEMINI_API_KEY:
-    logger.warning("GEMINI_API_KEY is not set in config/env. Gemini API calls will fail.")
-genai.configure(api_key=config.GEMINI_API_KEY)
-
-# Define the expected JSON output schema for Gemini
-class TradingDecision(BaseModel):
-    action: str = Field(description="The trading action to take: LONG, SHORT, or WAIT")
-    confidence_score: float = Field(description="Confidence score between 0.0 and 1.0")
-    reasoning: str = Field(description="A short explanation of why this decision was made based on the provided metrics")
 
 class AgentOrchestrator:
     def __init__(self):
         self.redis_client: Optional[redis.Redis] = None
         self.pubsub = None
         
-        # State: In-memory numerical state per symbol
-        # { "BTCUSDT": {"cvd_1m": 0, "cvd_5m": 0, "imbalance": 0.5, "mark_price": 0.0} }
-        self.state: Dict[str, Dict[str, float]] = {
-            s.upper(): {"cvd_1m": 0.0, "cvd_5m": 0.0, "imbalance": 0.5, "mark_price": 0.0}
-            for s in config.SYMBOLS
-        }
-        
+        # State: In-memory numerical state per symbol (core + dynamically added).
+        self.state: Dict[str, Dict[str, float]] = {}
         # Cooldown state: last trigger timestamp per symbol
-        self.last_trigger: Dict[str, float] = {s.upper(): 0.0 for s in config.SYMBOLS}
+        self.last_trigger: Dict[str, float] = {}
         self.cooldown_seconds = 60.0
-        
-        # Initialize Gemini Model
-        self.model = genai.GenerativeModel(
-            model_name="gemini-2.5-flash",
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-                response_schema=TradingDecision,
-                temperature=0.2, # Low temperature for more deterministic outputs
-            )
-        )
+        for s in config.SYMBOLS:
+            self._ensure_symbol(s.upper())
+
+        # Narrative/sector bonus map {SYMBOL: bonus}, refreshed from narrative_agent.
+        self.narrative_map: Dict[str, float] = {}
+
+    def _ensure_symbol(self, sym_upper: str):
+        """Register a symbol (core or dynamically discovered) for evaluation."""
+        if sym_upper not in self.state:
+            self.state[sym_upper] = {
+                "cvd_1m": 0.0, "cvd_5m": 0.0, "imbalance": 0.5, "mark_price": 0.0,
+                # liquidity-level features (from features:levels)
+                "last_price": 0.0, "swing_high": 0.0, "swing_low": 0.0,
+                "recent_min": 0.0, "recent_max": 0.0, "range_1m": 0.0,
+                "sweep_low": False, "sweep_high": False,
+                # indicator layers
+                "ema_fast": 0.0, "ema_slow": 0.0, "rsi": 50.0, "atr": 0.0,
+            }
+            self.last_trigger[sym_upper] = 0.0
 
     async def initialize(self):
         logger.info(f"Connecting to Redis at {config.REDIS_URL}")
         self.redis_client = redis.from_url(config.REDIS_URL, decode_responses=False)
         self.pubsub = self.redis_client.pubsub()
-        await self.pubsub.psubscribe("features:*", "market:markprice:*")
-        logger.info("Subscribed to features and markprice channels.")
+        await self.pubsub.psubscribe("features:*", "market:markprice:*", "narrative:sectors")
+        logger.info("Subscribed to features, markprice and narrative channels.")
+
+        # Seed the narrative bonus map from its last persisted value (if any).
+        try:
+            import narrative_agent
+            raw = await self.redis_client.get(narrative_agent.NARRATIVE_MAP_KEY)
+            if raw:
+                payload = orjson.loads(raw)
+                self.narrative_map = {k.upper(): float(v)
+                                      for k, v in payload.get("bonus_map", {}).items()}
+                logger.info(f"Seeded narrative bonus map: {self.narrative_map}")
+        except Exception as e:
+            logger.warning(f"Could not seed narrative map: {e}")
 
     async def cleanup(self):
         if self.pubsub:
@@ -72,83 +83,125 @@ class AgentOrchestrator:
             if channel.startswith("market:markprice:"):
                 symbol = parts[-1]
                 # Binance markPriceUpdate payload typically has 'p' for mark price
-                if symbol in self.state and 'p' in data:
+                if 'p' in data:
+                    self._ensure_symbol(symbol)
                     self.state[symbol]["mark_price"] = float(data['p'])
-                    
+
             elif channel.startswith("features:cvd:"):
                 symbol = parts[-1]
-                if symbol in self.state:
-                    self.state[symbol]["cvd_1m"] = float(data.get("cvd_1m", 0.0))
-                    self.state[symbol]["cvd_5m"] = float(data.get("cvd_5m", 0.0))
-                    
+                self._ensure_symbol(symbol)
+                self.state[symbol]["cvd_1m"] = float(data.get("cvd_1m", 0.0))
+                self.state[symbol]["cvd_5m"] = float(data.get("cvd_5m", 0.0))
+
             elif channel.startswith("features:imbalance:"):
                 symbol = parts[-1]
-                if symbol in self.state:
-                    self.state[symbol]["imbalance"] = float(data.get("imbalance", 0.5))
+                self._ensure_symbol(symbol)
+                self.state[symbol]["imbalance"] = float(data.get("imbalance", 0.5))
+
+            elif channel.startswith("features:levels:"):
+                symbol = parts[-1]
+                self._ensure_symbol(symbol)
+                st = self.state[symbol]
+                for k in ("last_price", "swing_high", "swing_low", "recent_min",
+                          "recent_max", "range_1m", "ema_fast", "ema_slow", "rsi", "atr"):
+                    if k in data:
+                        st[k] = float(data[k])
+                st["sweep_low"] = bool(data.get("sweep_low", False))
+                st["sweep_high"] = bool(data.get("sweep_high", False))
+
+            elif channel == "narrative:sectors":
+                bm = data.get("bonus_map", {})
+                self.narrative_map = {k.upper(): float(v) for k, v in bm.items()}
+                logger.info(f"Narrative bonus map updated ({'LIVE' if data.get('grounded') else 'STALE'}): {self.narrative_map}")
         except (KeyError, ValueError) as e:
             logger.error(f"Error updating state for channel {channel}: {e}")
 
-    async def _call_gemini_agent(self, symbol: str, current_state: dict):
-        """Non-blocking background task to call Gemini and publish the decision."""
-        logger.info(f"Triggering Gemini Agent for {symbol}. State: {current_state}")
-        
-        prompt = f"""
-        You are an elite quantitative trading AI. Analyze the following real-time orderflow and market data for {symbol}.
-        
-        Market Data:
-        - Mark Price: {current_state['mark_price']}
-        - Cumulative Volume Delta (1 min): {current_state['cvd_1m']}
-        - Cumulative Volume Delta (5 min): {current_state['cvd_5m']}
-        - Orderbook Imbalance (Top 10 Levels): {current_state['imbalance']} 
-          (Note: Imbalance > 0.5 indicates more Bid volume, < 0.5 indicates more Ask volume)
-          
-        Rules:
-        1. If Imbalance is heavily skewed (> 0.70) and CVD is positive, it might indicate strong buying pressure. Consider LONG.
-        2. If Imbalance is heavily skewed (< 0.30) and CVD is negative, it might indicate strong selling pressure. Consider SHORT.
-        3. If signals are mixed, action should be WAIT.
-        
-        Provide your response exactly matching the requested JSON schema.
+    def _evaluate_symbol(self, symbol: str, current_state: dict):
+        """Deterministic decision for a symbol using our own signal engine.
+
+        No LLM: the same input always yields the same output, which is what
+        makes it fast, free, backtestable, and learnable. Emits a pending
+        signal (for manual approval) only when conviction clears the floor.
         """
-        
-        try:
-            response = await self.model.generate_content_async(prompt)
-            
-            # The response text should be valid JSON matching the schema
-            decision_text = response.text
-            decision_dict = orjson.loads(decision_text)
-            
-            # Validate with Pydantic
-            decision = TradingDecision(**decision_dict)
-            logger.info(f"[{symbol}] Gemini Decision: {decision.action} (Confidence: {decision.confidence_score}) | Reason: {decision.reasoning}")
-            
-            # Always log the AI's thought process to the Dashboard so the user can see it live!
-            config.send_log_to_dashboard(
-                "AgentOrchestrator", 
-                decision.action, 
-                f"[{symbol}] Confidence: %{int(decision.confidence_score * 100)}. Reason: {decision.reasoning}"
+        logger.info(f"Evaluating {symbol}. State: {current_state}")
+
+        # Inject the current narrative/sector bonus for this symbol.
+        current_state["sector_bonus"] = self.narrative_map.get(symbol, 0.0)
+
+        # Pick the strategy (default: 5-layer confluence).
+        if config.STRATEGY == "confluence":
+            sig = signal_engine.evaluate_confluence(
+                current_state,
+                wick_buffer_mult=config.SL_WICK_BUFFER_MULT,
+                tp_r_multiple=config.TP_R_MULTIPLE,
+                min_sl_pct=config.MIN_SL_PCT,
+                max_sl_pct=config.MAX_SL_PCT,
             )
-            
-            if decision.action in ["LONG", "SHORT"] and decision.confidence_score > 0.75:
-                logger.info(f"[{symbol}] Generating Pending Approval for {decision.action} signal.")
-                
-                if config.supabase:
-                    def _insert_pending_signal():
-                        try:
-                            config.supabase.table("pending_signals").insert({
-                                "symbol": symbol,
-                                "action": decision.action,
-                                "confidence": decision.confidence_score,
-                                "reasoning": decision.reasoning,
-                                "status": "PENDING"
-                            }).execute()
-                            logger.info(f"[{symbol}] Dispatched PENDING signal to Dashboard for user approval.")
-                        except Exception as e:
-                            logger.error(f"[{symbol}] Failed to insert pending signal to Supabase: {e}")
-                    
-                    asyncio.create_task(asyncio.to_thread(_insert_pending_signal))
-                
-        except Exception as e:
-            logger.error(f"Error calling Gemini or processing response for {symbol}: {e}")
+        elif config.STRATEGY == "sweep_reversal":
+            sig = signal_engine.evaluate_sweep(
+                current_state,
+                wick_buffer_mult=config.SL_WICK_BUFFER_MULT,
+                tp_r_multiple=config.TP_R_MULTIPLE,
+                min_sl_pct=config.MIN_SL_PCT,
+                max_sl_pct=config.MAX_SL_PCT,
+            )
+        else:
+            sig = signal_engine.evaluate(current_state)
+
+        logger.info(f"[{symbol}] Decision: {sig.action} (Confidence: {sig.confidence:.2f}) | {sig.reasoning}")
+
+        # Log every decision to the dashboard so the reasoning is visible live.
+        config.send_log_to_dashboard(
+            "AgentOrchestrator",
+            sig.action,
+            f"[{symbol}] Confidence: %{int(sig.confidence * 100)}. {sig.reasoning}"
+        )
+
+        if sig.action in ("LONG", "SHORT") and sig.confidence >= MIN_CONFIDENCE:
+            logger.info(f"[{symbol}] Generating Pending Approval for {sig.action} signal.")
+
+            if config.supabase:
+                # Snapshot the exact features so the trade journal can later
+                # correlate these entry conditions with the realised outcome.
+                features = {
+                    "mark_price": current_state.get("mark_price"),
+                    "last_price": current_state.get("last_price"),
+                    "cvd_1m": current_state.get("cvd_1m"),
+                    "cvd_5m": current_state.get("cvd_5m"),
+                    "imbalance": current_state.get("imbalance"),
+                    "swing_high": current_state.get("swing_high"),
+                    "swing_low": current_state.get("swing_low"),
+                    "sweep_low": current_state.get("sweep_low"),
+                    "sweep_high": current_state.get("sweep_high"),
+                    "ema_fast": current_state.get("ema_fast"),
+                    "ema_slow": current_state.get("ema_slow"),
+                    "rsi": current_state.get("rsi"),
+                    "atr": current_state.get("atr"),
+                    "sector_bonus": current_state.get("sector_bonus"),
+                    "layer_contributions": sig.contributions,
+                    # structure-based bracket the execution engine should honour
+                    "sl_price": sig.sl_price,
+                    "tp_price": sig.tp_price,
+                }
+
+                def _insert_pending_signal():
+                    try:
+                        config.supabase.table("pending_signals").insert({
+                            "symbol": symbol,
+                            "action": sig.action,
+                            "confidence": sig.confidence,
+                            "reasoning": sig.reasoning,
+                            "score": sig.score,
+                            "features": features,
+                            "sl_price": sig.sl_price,
+                            "tp_price": sig.tp_price,
+                            "status": "PENDING"
+                        }).execute()
+                        logger.info(f"[{symbol}] Dispatched PENDING signal to Dashboard for user approval.")
+                    except Exception as e:
+                        logger.error(f"[{symbol}] Failed to insert pending signal to Supabase: {e}")
+
+                asyncio.create_task(asyncio.to_thread(_insert_pending_signal))
 
     async def listen_to_channels(self):
         """Listen to incoming Redis messages and update state."""
@@ -172,27 +225,30 @@ class AgentOrchestrator:
         while True:
             try:
                 current_time = time.time()
-                
-                for symbol in config.SYMBOLS:
-                    sym_upper = symbol.upper()
+
+                # Evaluate ALL tracked symbols (core + dynamically discovered).
+                for sym_upper in list(self.state.keys()):
                     state = self.state[sym_upper]
-                    
+
                     # Check Cooldown
                     if current_time - self.last_trigger[sym_upper] < self.cooldown_seconds:
                         continue
-                    
-                    imbalance = state["imbalance"]
-                    
-                    # Trigger Condition: Heavy Buy Wall or Heavy Sell Wall
-                    if imbalance > 0.70 or imbalance < 0.30:
+
+                    # Trigger condition depends on the active strategy.
+                    if config.STRATEGY in ("confluence", "sweep_reversal"):
+                        # Fire when a liquidity sweep just printed on either side.
+                        triggered = state.get("sweep_low") or state.get("sweep_high")
+                    else:
+                        imbalance = state["imbalance"]
+                        triggered = imbalance > 0.70 or imbalance < 0.30
+
+                    if triggered:
                         # Update last trigger time immediately to prevent spam
                         self.last_trigger[sym_upper] = current_time
-                        
-                        # Snapshot the state to pass to the agent
+
+                        # Snapshot the state and evaluate deterministically (cheap, local)
                         state_snapshot = state.copy()
-                        
-                        # Spawn background task so evaluation loop doesn't block
-                        asyncio.create_task(self._call_gemini_agent(sym_upper, state_snapshot))
+                        self._evaluate_symbol(sym_upper, state_snapshot)
                         
             except Exception as e:
                 logger.error(f"Error in evaluate_triggers loop: {e}")

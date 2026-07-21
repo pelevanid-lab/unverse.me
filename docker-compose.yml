@@ -20,6 +20,17 @@ services:
       - redis
     restart: always
 
+  narrative_agent:
+    build: .
+    container_name: unverse_narrative_agent
+    command: python narrative_agent.py
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+    restart: always
+
   data_streamer:
     build: .
     container_name: unverse_data_streamer

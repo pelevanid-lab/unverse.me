@@ -2,16 +2,19 @@
 
 import { useEffect, useState } from "react";
 import { supabase } from "@/utils/supabase/client";
-import { 
-  Activity, 
-  Briefcase, 
-  History, 
-  Wallet, 
+import {
+  Activity,
+  Briefcase,
+  History,
+  Wallet,
   TrendingUp,
   TerminalSquare,
   CheckCircle,
   XCircle,
-  Clock
+  Clock,
+  Settings,
+  Sparkles,
+  Save
 } from "lucide-react";
 import { format } from "date-fns";
 
@@ -21,24 +24,35 @@ export default function Dashboard() {
   const [history, setHistory] = useState<any[]>([]);
   const [wallets, setWallets] = useState<any[]>([]);
   const [pendingSignals, setPendingSignals] = useState<any[]>([]);
+  const [narrative, setNarrative] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+
+  // Editable bot config (seeded once so the 10s refresh doesn't clobber typing).
+  const [cfgSymbols, setCfgSymbols] = useState("");
+  const [cfgStrategy, setCfgStrategy] = useState("confluence");
+  const [cfgRisk, setCfgRisk] = useState("0.015");
+  const [cfgTpR, setCfgTpR] = useState("2.0");
+  const [cfgLeverage, setCfgLeverage] = useState("10");
+  const [cfgSeeded, setCfgSeeded] = useState(false);
+  const [cfgSaving, setCfgSaving] = useState(false);
+  const [cfgSavedMsg, setCfgSavedMsg] = useState("");
 
   useEffect(() => {
     fetchData();
-    // Opsiyonel: Her 5 saniyede bir güncellenmesi için interval eklenebilir
     const interval = setInterval(fetchData, 10000);
     return () => clearInterval(interval);
   }, []);
 
   const fetchData = async () => {
     try {
-      // Supabase'den verileri eşzamanlı çekiyoruz
-      const [logsRes, tradesRes, historyRes, walletsRes, pendingRes] = await Promise.all([
+      const [logsRes, tradesRes, historyRes, walletsRes, pendingRes, configRes, narrativeRes] = await Promise.all([
         supabase.from("agent_logs").select("*").order("created_at", { ascending: false }).limit(20),
         supabase.from("active_trades").select("*").eq("status", "OPEN").order("created_at", { ascending: false }),
         supabase.from("trade_history").select("*").order("closed_at", { ascending: false }).limit(50),
         supabase.from("wallets").select("*").order("updated_at", { ascending: false }),
-        supabase.from("pending_signals").select("*").eq("status", "PENDING").order("created_at", { ascending: false })
+        supabase.from("pending_signals").select("*").eq("status", "PENDING").order("created_at", { ascending: false }),
+        supabase.from("bot_config").select("*"),
+        supabase.from("narrative_trends").select("*").order("updated_at", { ascending: false }).limit(1)
       ]);
 
       if (logsRes.data) setLogs(logsRes.data);
@@ -46,10 +60,45 @@ export default function Dashboard() {
       if (historyRes.data) setHistory(historyRes.data);
       if (walletsRes.data) setWallets(walletsRes.data);
       if (pendingRes.data) setPendingSignals(pendingRes.data);
+      if (narrativeRes.data && narrativeRes.data.length) setNarrative(narrativeRes.data[0]);
+
+      // Seed the config form once from bot_config.
+      if (configRes.data && !cfgSeeded) {
+        const cfg: Record<string, any> = {};
+        configRes.data.forEach((row: any) => { cfg[row.key] = row.value; });
+        if (Array.isArray(cfg.symbols)) setCfgSymbols(cfg.symbols.join(", "));
+        if (cfg.strategy) setCfgStrategy(String(cfg.strategy));
+        if (cfg.risk_per_trade_pct != null) setCfgRisk(String(cfg.risk_per_trade_pct));
+        if (cfg.tp_r_multiple != null) setCfgTpR(String(cfg.tp_r_multiple));
+        if (cfg.leverage != null) setCfgLeverage(String(cfg.leverage));
+        setCfgSeeded(true);
+      }
     } catch (error) {
       console.error("Data fetch error:", error);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleSaveConfig = async () => {
+    setCfgSaving(true);
+    setCfgSavedMsg("");
+    try {
+      const symbols = cfgSymbols.split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+      const rows = [
+        { key: "symbols", value: symbols },
+        { key: "strategy", value: cfgStrategy },
+        { key: "risk_per_trade_pct", value: Number(cfgRisk) },
+        { key: "tp_r_multiple", value: Number(cfgTpR) },
+        { key: "leverage", value: Number(cfgLeverage) },
+      ];
+      await supabase.from("bot_config").upsert(rows, { onConflict: "key" });
+      setCfgSavedMsg("Kaydedildi. Ajanlar bir sonraki başlangıçta uygular.");
+    } catch (error) {
+      console.error("Error saving config:", error);
+      setCfgSavedMsg("Kaydetme hatası.");
+    } finally {
+      setCfgSaving(false);
     }
   };
 
@@ -103,6 +152,14 @@ export default function Dashboard() {
           <a href="#wallets" className="flex items-center gap-3 hover:text-slate-200 p-3 rounded-lg cursor-pointer transition">
             <Wallet size={20} />
             Wallets
+          </a>
+          <a href="#narratives" className="flex items-center gap-3 hover:text-slate-200 p-3 rounded-lg cursor-pointer transition">
+            <Sparkles size={20} />
+            Narratives
+          </a>
+          <a href="#settings" className="flex items-center gap-3 hover:text-slate-200 p-3 rounded-lg cursor-pointer transition">
+            <Settings size={20} />
+            Settings
           </a>
         </nav>
       </div>
@@ -302,6 +359,97 @@ export default function Dashboard() {
                     </div>
                   ))
                 )}
+              </div>
+            </div>
+
+            {/* HOT NARRATIVES (from the Gemini narrative agent) */}
+            <div id="narratives" className="bg-[#1a1d2d] border border-slate-800 rounded-xl p-6 scroll-mt-6">
+              <div className="flex items-center gap-2 mb-6">
+                <Sparkles className="text-fuchsia-500" size={24}/>
+                <h2 className="text-xl font-bold text-white">Hot Narratives</h2>
+                {narrative && (
+                  <span className={`ml-2 text-xs font-bold px-2 py-1 rounded ${narrative.grounded ? "bg-emerald-500/20 text-emerald-400" : "bg-amber-500/20 text-amber-400"}`}>
+                    {narrative.grounded ? "LIVE" : "STALE"}
+                  </span>
+                )}
+              </div>
+              {(!narrative || !Array.isArray(narrative.sectors) || narrative.sectors.length === 0) ? (
+                <p className="text-slate-500 text-sm">Narrative agent henüz veri üretmedi.</p>
+              ) : (
+                <div className="space-y-3">
+                  {narrative.sectors.map((s: any, i: number) => (
+                    <div key={i} className="p-4 bg-[#0f111a] rounded-lg border border-slate-800">
+                      <div className="flex justify-between items-center mb-2">
+                        <span className="text-white font-medium">{s.sector}</span>
+                        <span className="text-fuchsia-400 text-xs font-bold">heat {Number(s.heat).toFixed(2)}</span>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {(s.tokens || []).map((t: string, j: number) => (
+                          <span key={j} className="px-2 py-1 bg-slate-800 rounded text-xs text-slate-300 font-medium">{t}</span>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                  {!narrative.grounded && (
+                    <p className="text-amber-400/80 text-xs mt-2">
+                      Uyarı: Bu liste canlı aramadan değil, modelin eğitim verisinden geldi — güncel olmayabilir.
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* SETTINGS (UI-editable bot config) */}
+            <div id="settings" className="bg-[#1a1d2d] border border-slate-800 rounded-xl p-6 scroll-mt-6">
+              <div className="flex items-center gap-2 mb-6">
+                <Settings className="text-blue-400" size={24}/>
+                <h2 className="text-xl font-bold text-white">Bot Settings</h2>
+              </div>
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">Watchlist (coinler, virgülle)</label>
+                  <input
+                    value={cfgSymbols}
+                    onChange={(e) => setCfgSymbols(e.target.value)}
+                    placeholder="btcusdt, ondousdt, dogeusdt"
+                    className="w-full bg-[#0f111a] border border-slate-800 rounded-lg px-3 py-2 text-slate-200 text-sm focus:outline-none focus:border-blue-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">Strateji</label>
+                  <select
+                    value={cfgStrategy}
+                    onChange={(e) => setCfgStrategy(e.target.value)}
+                    className="w-full bg-[#0f111a] border border-slate-800 rounded-lg px-3 py-2 text-slate-200 text-sm focus:outline-none focus:border-blue-500"
+                  >
+                    <option value="confluence">confluence (5 katman + narratif)</option>
+                    <option value="sweep_reversal">sweep_reversal</option>
+                    <option value="flow">flow</option>
+                  </select>
+                </div>
+                <div className="grid grid-cols-3 gap-3">
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Risk / işlem</label>
+                    <input value={cfgRisk} onChange={(e) => setCfgRisk(e.target.value)}
+                      className="w-full bg-[#0f111a] border border-slate-800 rounded-lg px-3 py-2 text-slate-200 text-sm focus:outline-none focus:border-blue-500" />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">TP (R)</label>
+                    <input value={cfgTpR} onChange={(e) => setCfgTpR(e.target.value)}
+                      className="w-full bg-[#0f111a] border border-slate-800 rounded-lg px-3 py-2 text-slate-200 text-sm focus:outline-none focus:border-blue-500" />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Kaldıraç</label>
+                    <input value={cfgLeverage} onChange={(e) => setCfgLeverage(e.target.value)}
+                      className="w-full bg-[#0f111a] border border-slate-800 rounded-lg px-3 py-2 text-slate-200 text-sm focus:outline-none focus:border-blue-500" />
+                  </div>
+                </div>
+                <button onClick={handleSaveConfig} disabled={cfgSaving}
+                  className="flex items-center gap-2 px-4 py-2 bg-blue-500 hover:bg-blue-600 disabled:opacity-50 text-white rounded-lg font-bold transition">
+                  <Save size={18} />
+                  {cfgSaving ? "Kaydediliyor..." : "Ayarları Kaydet"}
+                </button>
+                {cfgSavedMsg && <p className="text-xs text-slate-400">{cfgSavedMsg}</p>}
               </div>
             </div>
 
