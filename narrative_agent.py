@@ -56,40 +56,56 @@ class NarrativeView(BaseModel):
     sectors: list[Sector]
 
 
+def _extract_json(text: str) -> dict:
+    """Pull a JSON object out of a model reply that may wrap it in prose/fences."""
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = t.split("```")[1] if "```" in t[3:] else t.strip("`")
+        if t.lstrip().startswith("json"):
+            t = t.lstrip()[4:]
+    start, end = t.find("{"), t.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError(f"No JSON object found in model reply: {text[:200]}")
+    return orjson.loads(t[start:end + 1])
+
+
 class NarrativeAgent:
     def __init__(self):
         self.redis_client = None
         self.grounded = False
-        self.model = self._build_model()
 
-    def _build_model(self):
-        """Build a Gemini model, attaching Google Search grounding if we can."""
-        gen_cfg = genai.GenerationConfig(
-            response_mime_type="application/json",
-            response_schema=NarrativeView,
-            temperature=0.3,
+    def _attempts(self):
+        """Ordered generation strategies: grounded first, ungrounded last.
+
+        IMPORTANT: Gemini does not allow the Google Search tool together with
+        structured JSON output (response_schema). So the grounded attempts ask
+        for JSON *in the prompt* and we parse it ourselves; only the final,
+        ungrounded fallback can use the strict schema.
+        Failures are only visible at generate() time, not construction, so each
+        attempt is fully exercised inside run_cycle.
+        """
+        return [
+            ("google_search", [{"google_search": {}}], True),
+            ("google_search_retrieval", [{"google_search_retrieval": {}}], True),
+            (None, None, False),  # ungrounded fallback
+        ]
+
+    def _build_model(self, tools, grounded: bool):
+        if grounded:
+            # Free-form text + our own JSON parsing (schema is not allowed here).
+            return genai.GenerativeModel(
+                model_name="gemini-2.5-flash",
+                generation_config=genai.GenerationConfig(temperature=0.3),
+                tools=tools,
+            )
+        return genai.GenerativeModel(
+            model_name="gemini-2.5-flash",
+            generation_config=genai.GenerationConfig(
+                response_mime_type="application/json",
+                response_schema=NarrativeView,
+                temperature=0.3,
+            ),
         )
-        # Try to enable live search grounding. The exact tool name has changed
-        # across Gemini versions, so we attempt the modern one and fall back.
-        for tool in ("google_search", "google_search_retrieval"):
-            try:
-                model = genai.GenerativeModel(
-                    model_name="gemini-2.5-flash",
-                    generation_config=gen_cfg,
-                    tools=tool,
-                )
-                self.grounded = True
-                logger.info(f"Narrative model using live grounding via '{tool}'.")
-                return model
-            except Exception as e:
-                logger.debug(f"Grounding tool '{tool}' unavailable: {e}")
-        # Fallback: no grounding. Structured output can't be combined with the
-        # search tool on every version, so this path answers from training data.
-        logger.warning("Google Search grounding NOT available. Narrative results "
-                       "will come from Gemini's training data and may be STALE. "
-                       "Treat the sector bonus as a weak prior, not live truth.")
-        self.grounded = False
-        return genai.GenerativeModel(model_name="gemini-2.5-flash", generation_config=gen_cfg)
 
     async def initialize(self):
         self.redis_client = redis.from_url(config.REDIS_URL, decode_responses=False)
@@ -114,17 +130,47 @@ class NarrativeAgent:
         return bonus_map
 
     async def run_cycle(self):
-        prompt = (
+        base_prompt = (
             "You are a crypto market analyst. Identify the 3 to 5 HOTTEST crypto "
             "narratives / sectors that capital is rotating into RIGHT NOW "
             "(e.g. AI agents, RWA, DePIN, memecoins, L2s, etc.). For each sector "
             "give a heat score 0..1 and the leading Binance-listed tokens (base "
-            "symbols only, e.g. ONDO, FET). Prefer liquid perpetual-futures tokens. "
-            "Return the exact JSON schema requested."
+            "symbols only, e.g. ONDO, FET). Prefer liquid perpetual-futures tokens."
         )
+        json_instruction = (
+            "\n\nReply with ONLY a JSON object, no prose, no markdown fences, "
+            'in exactly this shape: {"sectors":[{"sector":"AI agents","heat":0.9,'
+            '"tokens":["FET","TAO"]}]}'
+        )
+
+        view = None
+        # Try grounded first; fall back through to ungrounded so a tool-name
+        # change on Google's side can never take the whole agent down.
+        for label, tools, grounded in self._attempts():
+            try:
+                model = self._build_model(tools, grounded)
+                prompt = base_prompt + (json_instruction if grounded else
+                                        "\nReturn the exact JSON schema requested.")
+                response = await model.generate_content_async(prompt)
+                view = NarrativeView(**_extract_json(response.text)) if grounded \
+                    else NarrativeView(**orjson.loads(response.text))
+                self.grounded = grounded
+                logger.info(f"Narrative generated via "
+                            f"{'grounded:' + label if grounded else 'UNGROUNDED fallback'}.")
+                break
+            except Exception as e:
+                logger.warning(f"Narrative attempt "
+                               f"'{label or 'ungrounded'}' failed: {e}")
+
+        if view is None:
+            logger.error("All narrative attempts failed; no bonus map published.")
+            return False
+
+        if not self.grounded:
+            logger.warning("Narrative is UNGROUNDED (from training data) and may be "
+                           "STALE. Treat the sector bonus as a weak prior.")
+
         try:
-            response = await self.model.generate_content_async(prompt)
-            view = NarrativeView(**orjson.loads(response.text))
             bonus_map = self._build_bonus_map(view)
 
             payload = {
@@ -160,16 +206,22 @@ class NarrativeAgent:
                         logger.error(f"Failed to persist narrative_trends: {e}")
                 asyncio.create_task(asyncio.to_thread(_persist))
 
+            return True
+
         except Exception as e:
-            logger.error(f"Narrative cycle failed: {e}")
+            logger.error(f"Narrative publish failed: {e}")
+            return False
 
     async def run(self):
         await self.initialize()
         try:
             while True:
-                await self.run_cycle()
-                logger.info(f"Narrative agent sleeping {NARRATIVE_INTERVAL}s.")
-                await asyncio.sleep(NARRATIVE_INTERVAL)
+                ok = await self.run_cycle()
+                # Don't sit idle for 4h after a failure — retry soon instead.
+                delay = NARRATIVE_INTERVAL if ok else 300
+                logger.info(f"Narrative agent sleeping {delay}s "
+                            f"({'ok' if ok else 'retry after failure'}).")
+                await asyncio.sleep(delay)
         finally:
             await self.cleanup()
 
