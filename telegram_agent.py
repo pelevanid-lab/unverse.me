@@ -4,7 +4,7 @@ import logging
 import orjson
 import redis.asyncio as redis
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, MenuButtonWebApp, WebAppInfo
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 from supabase import create_client, Client
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -16,6 +16,16 @@ VERCEL_URL = os.getenv("VERCEL_URL", "")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+
+async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.message.chat_id) != TELEGRAM_CHAT_ID:
+        return
+        
+    keyboard = [
+        [InlineKeyboardButton("📊 Dashboard'u Aç", web_app=WebAppInfo(url=VERCEL_URL))]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Sistem hazır! Güvenli giriş yapmak için aşağıdaki butona tıklayın:", reply_markup=reply_markup)
 
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -89,6 +99,7 @@ async def main():
         return
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("dashboard", dashboard_command))
     app.add_handler(CallbackQueryHandler(button_callback))
     
     await app.initialize()
