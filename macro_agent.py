@@ -21,6 +21,10 @@ MAX_DYNAMIC_SYMBOLS = int(os.getenv("MAX_DYNAMIC_SYMBOLS", "3"))
 W_OI_SURGE = float(os.getenv("W_OI_SURGE", "1.0"))
 W_VOLUME = float(os.getenv("W_VOLUME", "0.6"))
 W_MOMENTUM = float(os.getenv("W_MOMENTUM", "0.5"))
+# Minimum 24h quote volume for a candidate. Keeps thin / exotic listings
+# (tokenised equities, commodities, brand-new pairs) out of the watchlist:
+# they surge on OI but are illiquid and can lack the streams we subscribe to.
+MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "50000000"))
 
 
 class MacroAgent:
@@ -110,7 +114,7 @@ class MacroAgent:
                 if not binance_id.endswith('USDT'):
                     continue
                 quote_vol = float(ticker.get('quoteVolume', 0) or 0)
-                if quote_vol <= 0:
+                if quote_vol < MIN_QUOTE_VOLUME:
                     continue
                 candidates.append({
                     "symbol": binance_id,

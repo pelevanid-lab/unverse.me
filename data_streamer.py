@@ -33,6 +33,30 @@ class BinanceDataStreamer:
         # Task Tracking for graceful restarts
         self.ws_task: Optional[asyncio.Task] = None
         self.oi_task: Optional[asyncio.Task] = None
+
+        # Per-event-type counters so a dead stream is immediately visible.
+        self.event_counts: dict = {}
+        self.heartbeat_task: Optional[asyncio.Task] = None
+
+        # Symbols Binance actually lists as tradable USD-M perpetuals.
+        self.valid_symbols: Set[str] = set()
+
+    async def log_heartbeat(self):
+        """Every 60s report how many of each event type arrived.
+
+        A zero (or missing) count for aggTrade means the trade stream is dead,
+        which silently starves CVD, swing levels and every indicator downstream.
+        """
+        while True:
+            await asyncio.sleep(60)
+            snapshot = dict(self.event_counts)
+            self.event_counts = {}
+            if snapshot:
+                summary = ", ".join(f"{k}={v}" for k, v in sorted(snapshot.items()))
+                logger.info(f"[heartbeat] last 60s: {summary} | symbols={len(self.active_symbols)}")
+            else:
+                logger.error("[heartbeat] NO market events received in the last 60s! "
+                             "WebSocket is connected but delivering nothing.")
     
     async def initialize(self):
         logger.info(f"Connecting to Redis at {config.REDIS_URL}")
@@ -41,6 +65,31 @@ class BinanceDataStreamer:
         await self.pubsub.subscribe("control:dynamic_symbols")
         
         self._session = aiohttp.ClientSession()
+        await self._load_valid_symbols()
+
+    async def _load_valid_symbols(self):
+        """Fetch the real tradable USD-M perpetual list from Binance.
+
+        Binance's SUBSCRIBE is all-or-nothing: ONE invalid stream name makes it
+        reject the entire request, so every stream goes silent. The macro agent
+        can surface thin/exotic listings (tokenised equities etc.) that do not
+        have the streams we ask for, so we validate before subscribing.
+        """
+        url = f"{self.rest_url}/fapi/v1/exchangeInfo"
+        try:
+            async with self._session.get(url) as resp:
+                if resp.status != 200:
+                    logger.error(f"exchangeInfo failed ({resp.status}); skipping validation.")
+                    return
+                data = orjson.loads(await resp.read())
+            self.valid_symbols = {
+                s['symbol'].lower()
+                for s in data.get('symbols', [])
+                if s.get('status') == 'TRADING' and s.get('contractType') == 'PERPETUAL'
+            }
+            logger.info(f"Loaded {len(self.valid_symbols)} tradable perpetual symbols.")
+        except Exception as e:
+            logger.error(f"Could not load exchangeInfo: {e}")
 
     async def cleanup(self):
         if self.pubsub:
@@ -51,20 +100,42 @@ class BinanceDataStreamer:
             await self._session.close()
 
     def _get_streams(self) -> List[str]:
+        """Build the stream list, dropping symbols Binance does not actually list.
+
+        Without this filter a single bad symbol kills the whole subscription.
+        """
         streams = []
+        dropped = []
         for symbol in self.active_symbols:
+            if self.valid_symbols and symbol not in self.valid_symbols:
+                dropped.append(symbol)
+                continue
             streams.append(f"{symbol}@aggTrade")
             streams.append(f"{symbol}@depth10@100ms")
             streams.append(f"{symbol}@markPrice")
+        if dropped:
+            logger.warning(f"Dropped {len(dropped)} symbol(s) not tradable as "
+                           f"USD-M perpetuals: {dropped}")
         return streams
 
     async def handle_message(self, message: str):
         try:
             data = orjson.loads(message)
             if 'e' not in data:
+                # Not a market event. This is where Binance returns SUBSCRIBE
+                # acks and ERRORS - previously swallowed silently, which made a
+                # failed subscription look identical to a quiet market.
+                if 'error' in data:
+                    logger.error(f"Binance subscription ERROR: {data['error']}")
+                elif 'result' in data:
+                    logger.info(f"Binance subscribe ack (id={data.get('id')}): "
+                                f"result={data['result']}")
+                else:
+                    logger.debug(f"Non-event message: {str(data)[:200]}")
                 return
 
             event_type = data['e']
+            self.event_counts[event_type] = self.event_counts.get(event_type, 0) + 1
             symbol = data.get('s', '').upper()
             
             if event_type == 'aggTrade':
@@ -96,7 +167,8 @@ class BinanceDataStreamer:
 
         while True:
             try:
-                logger.info(f"Connecting to Binance WS for {len(self.active_symbols)} symbols...")
+                logger.info(f"Connecting to Binance WS for {len(self.active_symbols)} symbols "
+                            f"({len(streams)} streams): {streams}")
                 async with websockets.connect(self.ws_url) as ws:
                     logger.info("WebSocket connected. Subscribing to streams...")
                     await ws.send(orjson.dumps(subscribe_payload).decode('utf-8'))
@@ -157,6 +229,8 @@ class BinanceDataStreamer:
         logger.info(f"Starting workers for Active Symbols: {self.active_symbols}")
         self.ws_task = asyncio.create_task(self.connect_and_stream())
         self.oi_task = asyncio.create_task(self.poll_open_interest())
+        if not self.heartbeat_task or self.heartbeat_task.done():
+            self.heartbeat_task = asyncio.create_task(self.log_heartbeat())
 
     async def listen_for_control_signals(self):
         """Listen to dynamic satellite symbols updates and restart streams if changed."""
