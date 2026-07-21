@@ -112,9 +112,8 @@ class BinanceDataStreamer:
             if self.valid_symbols and symbol not in self.valid_symbols:
                 dropped.append(symbol)
                 continue
-            streams.append(f"{symbol}@aggTrade")
+            streams.append(f"{symbol}@trade")
             streams.append(f"{symbol}@depth10@100ms")
-            streams.append(f"{symbol}@markPrice")
         if dropped:
             logger.warning(f"Dropped {len(dropped)} symbol(s) not tradable as "
                            f"USD-M perpetuals: {dropped}")
@@ -150,12 +149,10 @@ class BinanceDataStreamer:
             self.event_counts[event_type] = self.event_counts.get(event_type, 0) + 1
             symbol = data.get('s', '').upper()
             
-            if event_type == 'aggTrade':
+            if event_type == 'trade':
                 channel = f"market:trades:{symbol}"
             elif event_type == 'depthUpdate':
                 channel = f"market:depth:{symbol}"
-            elif event_type == 'markPriceUpdate':
-                channel = f"market:markprice:{symbol}"
             else:
                 return
             
