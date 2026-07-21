@@ -3,8 +3,63 @@ version: '3.8'
 services:
   redis:
     image: redis:7-alpine
-    container_name: market_data_redis
+    container_name: unverse_redis
     ports:
       - "6379:6379"
     command: redis-server --save 60 1 --loglevel warning
+    restart: always
+
+  macro_agent:
+    build: .
+    container_name: unverse_macro_agent
+    command: python macro_agent.py
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+    restart: always
+
+  data_streamer:
+    build: .
+    container_name: unverse_data_streamer
+    command: python data_streamer.py
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+    restart: always
+
+  alpha_generator:
+    build: .
+    container_name: unverse_alpha_generator
+    command: python alpha_generator.py
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+    restart: always
+
+  agent_orchestrator:
+    build: .
+    container_name: unverse_agent_orchestrator
+    command: python agent_orchestrator.py
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+    restart: always
+
+  execution_engine:
+    build: .
+    container_name: unverse_execution_engine
+    command: python execution_engine.py
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
     restart: always
