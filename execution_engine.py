@@ -57,6 +57,35 @@ class ExecutionEngine:
                     symbol = pos['symbol'].replace("/", "").replace(":", "")
                     self.active_positions.add(symbol)
                     logger.info(f"Found active position for {symbol}. Tracking.")
+                    
+                    # Ensure it is in Supabase active_trades
+                    if config.supabase:
+                        def _sync_to_supabase(sym, position_data):
+                            try:
+                                # Check if already in Supabase
+                                res = config.supabase.table("active_trades").select("*").eq("symbol", sym).eq("status", "OPEN").execute()
+                                if not res.data:
+                                    entry_price = float(position_data.get('entryPrice', 0))
+                                    qty = float(position_data.get('contracts', 0))
+                                    
+                                    # Try to determine side from positionAmt (positive = long, negative = short)
+                                    pos_amt = float(position_data.get('info', {}).get('positionAmt', 0))
+                                    side = "LONG" if pos_amt > 0 else "SHORT"
+                                    leverage = int(position_data.get('leverage', config.DEFAULT_LEVERAGE))
+                                    
+                                    config.supabase.table("active_trades").insert({
+                                        "symbol": sym,
+                                        "side": side,
+                                        "entry_price": entry_price,
+                                        "leverage": leverage,
+                                        "quantity": qty,
+                                        "status": "OPEN"
+                                    }).execute()
+                                    logger.info(f"[{sym}] Synced pre-existing position to Dashboard.")
+                            except Exception as e:
+                                logger.error(f"[{sym}] Failed to sync pre-existing position: {e}")
+                                
+                        asyncio.create_task(asyncio.to_thread(_sync_to_supabase, symbol, pos))
         except Exception as e:
             logger.error(f"Failed to fetch initial positions: {e}")
 
