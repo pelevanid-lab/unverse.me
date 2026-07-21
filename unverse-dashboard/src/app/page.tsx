@@ -64,22 +64,22 @@ export default function Dashboard() {
           UNVERSE.ME
         </div>
         <nav className="flex flex-col gap-4 text-slate-400 font-medium">
-          <div className="flex items-center gap-3 text-blue-400 bg-blue-500/10 p-3 rounded-lg cursor-pointer">
+          <a href="#" className="flex items-center gap-3 text-blue-400 bg-blue-500/10 p-3 rounded-lg cursor-pointer transition">
             <TrendingUp size={20} />
             Dashboard
-          </div>
-          <div className="flex items-center gap-3 hover:text-slate-200 p-3 rounded-lg cursor-pointer transition">
+          </a>
+          <a href="#active-positions" className="flex items-center gap-3 hover:text-slate-200 p-3 rounded-lg cursor-pointer transition">
             <Briefcase size={20} />
             Active Trades
-          </div>
-          <div className="flex items-center gap-3 hover:text-slate-200 p-3 rounded-lg cursor-pointer transition">
+          </a>
+          <a href="#trade-history" className="flex items-center gap-3 hover:text-slate-200 p-3 rounded-lg cursor-pointer transition">
             <History size={20} />
             Trade History
-          </div>
-          <div className="flex items-center gap-3 hover:text-slate-200 p-3 rounded-lg cursor-pointer transition">
+          </a>
+          <a href="#wallets" className="flex items-center gap-3 hover:text-slate-200 p-3 rounded-lg cursor-pointer transition">
             <Wallet size={20} />
             Wallets
-          </div>
+          </a>
         </nav>
       </div>
 
@@ -105,7 +105,7 @@ export default function Dashboard() {
           <div className="xl:col-span-2 flex flex-col gap-8">
             
             {/* ACTIVE TRADES */}
-            <div className="bg-[#1a1d2d] border border-slate-800 rounded-xl p-6">
+            <div id="active-positions" className="bg-[#1a1d2d] border border-slate-800 rounded-xl p-6 scroll-mt-6">
               <div className="flex items-center gap-2 mb-6">
                 <Briefcase className="text-blue-500" size={24}/>
                 <h2 className="text-xl font-bold text-white">Active Positions</h2>
@@ -145,7 +145,7 @@ export default function Dashboard() {
             </div>
 
             {/* TRADE HISTORY */}
-            <div className="bg-[#1a1d2d] border border-slate-800 rounded-xl p-6">
+            <div id="trade-history" className="bg-[#1a1d2d] border border-slate-800 rounded-xl p-6 scroll-mt-6">
               <div className="flex items-center gap-2 mb-6">
                 <History className="text-purple-500" size={24}/>
                 <h2 className="text-xl font-bold text-white">Trade History</h2>
@@ -218,7 +218,7 @@ export default function Dashboard() {
             </div>
 
             {/* WALLETS */}
-            <div className="bg-[#1a1d2d] border border-slate-800 rounded-xl p-6">
+            <div id="wallets" className="bg-[#1a1d2d] border border-slate-800 rounded-xl p-6 scroll-mt-6">
               <div className="flex items-center gap-2 mb-6">
                 <Wallet className="text-emerald-500" size={24}/>
                 <h2 className="text-xl font-bold text-white">Wallets</h2>

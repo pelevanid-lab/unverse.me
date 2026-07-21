@@ -89,8 +89,41 @@ class ExecutionEngine:
                                 logger.error(f"[{sym}] Failed to sync pre-existing position: {e}")
                                 
                         asyncio.create_task(asyncio.to_thread(_sync_to_supabase, symbol, pos))
+                        
+            # Start background wallet sync
+            asyncio.create_task(self.monitor_wallets())
+            
         except Exception as e:
             logger.error(f"Failed to fetch initial positions: {e}")
+            
+    async def monitor_wallets(self):
+        """Periodically fetches Binance wallet balance and updates Supabase."""
+        if not config.supabase:
+            return
+            
+        while True:
+            try:
+                balance = await self.exchange.fetch_balance()
+                total_margin = float(balance.get('USDT', {}).get('total', 0))
+                
+                def _update_wallet():
+                    try:
+                        # Upsert wallet data
+                        config.supabase.table("wallets").upsert({
+                            "id": 1, # Fixed ID for main wallet
+                            "wallet_name": "Binance Futures (Main)",
+                            "network": "Binance USD-M",
+                            "balance": total_margin,
+                            "updated_at": "now()"
+                        }).execute()
+                    except Exception as e:
+                        logger.error(f"Failed to sync wallet to dashboard: {e}")
+                        
+                asyncio.create_task(asyncio.to_thread(_update_wallet))
+            except Exception as e:
+                logger.error(f"Wallet monitor encountered an error: {e}")
+                
+            await asyncio.sleep(60.0) # Update every 60 seconds
 
     async def cleanup(self):
         if self.pubsub:
