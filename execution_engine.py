@@ -5,6 +5,7 @@ import time
 import ccxt.async_support as ccxt
 import redis.asyncio as redis
 from typing import Set
+from supabase import create_client, Client
 
 import config
 
@@ -18,6 +19,11 @@ class ExecutionEngine:
     def __init__(self):
         self.redis_client = None
         self.pubsub = None
+        
+        if config.SUPABASE_URL and config.SUPABASE_KEY:
+            self.supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+        else:
+            self.supabase = None
         
         # Local tracker to prevent duplicate entries
         self.active_positions: Set[str] = set()
@@ -186,6 +192,21 @@ class ExecutionEngine:
                 f"execution:status:{symbol}",
                 orjson.dumps(telemetry)
             )
+            
+            # 7. Supabase Persistence
+            if self.supabase:
+                try:
+                    def _insert_trade():
+                        self.supabase.table("trade_logs").insert({
+                            "symbol": symbol,
+                            "side": action,
+                            "entry_price": current_price,
+                            "status": "OPEN"
+                        }).execute()
+                    asyncio.create_task(asyncio.to_thread(_insert_trade))
+                    logger.info(f"[{symbol}] Dispatched Supabase insert for trade_logs.")
+                except Exception as e:
+                    logger.error(f"[{symbol}] Failed to dispatch Supabase insert: {e}")
             
         except Exception as e:
             logger.error(f"[{symbol}] Execution Pipeline Failed: {e}")

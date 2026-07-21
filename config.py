@@ -31,3 +31,7 @@ DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "3"))
 RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.015"))
 SL_PCT = float(os.getenv("SL_PCT", "0.015"))
 TP_PCT = float(os.getenv("TP_PCT", "0.03"))
+
+# Supabase Configuration
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
