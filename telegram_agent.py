@@ -3,7 +3,7 @@ import asyncio
 import logging
 import orjson
 import redis.asyncio as redis
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, MenuButtonWebApp, WebAppInfo
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 from supabase import create_client, Client
 
@@ -12,6 +12,7 @@ logger = logging.getLogger("TelegramAgent")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+VERCEL_URL = os.getenv("VERCEL_URL", "")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
@@ -91,6 +92,17 @@ async def main():
     app.add_handler(CallbackQueryHandler(button_callback))
     
     await app.initialize()
+    
+    if VERCEL_URL:
+        try:
+            await app.bot.set_chat_menu_button(
+                chat_id=TELEGRAM_CHAT_ID,
+                menu_button=MenuButtonWebApp(text="📊 Dashboard", web_app=WebAppInfo(url=VERCEL_URL))
+            )
+            logger.info("Set Telegram Web App Menu Button successfully.")
+        except Exception as e:
+            logger.error(f"Failed to set Menu Button: {e}")
+            
     await app.start()
     await app.updater.start_polling()
     

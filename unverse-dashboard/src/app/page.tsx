@@ -26,6 +26,7 @@ export default function Dashboard() {
   const [pendingSignals, setPendingSignals] = useState<any[]>([]);
   const [narrative, setNarrative] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+  const [authError, setAuthError] = useState("");
 
   // Editable bot config (seeded once so the 10s refresh doesn't clobber typing).
   const [cfgSymbols, setCfgSymbols] = useState("");
@@ -38,6 +39,26 @@ export default function Dashboard() {
   const [cfgSavedMsg, setCfgSavedMsg] = useState("");
 
   useEffect(() => {
+    const tg = (window as any).Telegram?.WebApp;
+    
+    // Güvenlik Kilidi: Telegram dışından gelenleri reddet
+    if (!tg || !tg.initDataUnsafe?.user) {
+      setAuthError("🚫 Yetkisiz Erişim. Lütfen paneli Telegram üzerinden açın.");
+      setLoading(false);
+      return;
+    }
+    
+    // Web App'i tam ekrana genişlet
+    tg.expand();
+
+    // Güvenlik Kilidi: Sadece Enes'in ID'sine izin ver (1495511765)
+    const userId = tg.initDataUnsafe.user.id;
+    if (userId !== 1495511765) {
+      setAuthError(`🚫 Yetkisiz Erişim. Bu panele erişim izniniz yok. (ID: ${userId})`);
+      setLoading(false);
+      return;
+    }
+
     fetchData();
     const interval = setInterval(fetchData, 10000);
     return () => clearInterval(interval);
@@ -123,8 +144,20 @@ export default function Dashboard() {
   // Toplam PnL Hesaplaması
   const totalPnL = history.reduce((acc, trade) => acc + (Number(trade.pnl) || 0), 0);
 
+  if (authError) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-[#0f111a] p-6">
+        <div className="bg-[#1a1d2d] border border-rose-500/30 rounded-xl p-8 max-w-md w-full text-center shadow-[0_0_30px_rgba(244,63,94,0.1)]">
+          <XCircle className="text-rose-500 mx-auto mb-4" size={48} />
+          <h2 className="text-xl font-bold text-white mb-2">Erişim Reddedildi</h2>
+          <p className="text-slate-400">{authError}</p>
+        </div>
+      </div>
+    );
+  }
+
   if (loading) {
-    return <div className="flex h-screen items-center justify-center text-slate-400">Yükleniyor...</div>;
+    return <div className="flex h-screen items-center justify-center text-slate-400 bg-[#0f111a]">Yükleniyor...</div>;
   }
 
   return (
