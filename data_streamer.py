@@ -121,6 +121,9 @@ class BinanceDataStreamer:
     async def handle_message(self, message: str):
         try:
             data = orjson.loads(message)
+            # Combined-stream endpoint wraps every event: {"stream":.., "data":..}
+            if 'stream' in data and 'data' in data:
+                data = data['data']
             if 'e' not in data:
                 # Not a market event. This is where Binance returns SUBSCRIBE
                 # acks and ERRORS - previously swallowed silently, which made a
@@ -156,36 +159,39 @@ class BinanceDataStreamer:
 
     async def connect_and_stream(self):
         streams = self._get_streams()
-        subscribe_payload = {
-            "method": "SUBSCRIBE",
-            "params": streams,
-            "id": 1
-        }
-        
+        if not streams:
+            logger.error("No valid streams to connect to. Waiting for symbols...")
+            return
+
+        # Use the COMBINED stream endpoint (/stream?streams=a/b/c) instead of
+        # connecting to /ws and sending a SUBSCRIBE message. The SUBSCRIBE path
+        # was acknowledged by Binance but silently delivered ONLY depthUpdate --
+        # aggTrade and markPriceUpdate never arrived, starving CVD and every
+        # price-based indicator. The combined endpoint delivers all of them.
+        base = self.ws_url.rsplit("/ws", 1)[0]  # wss://fstream.binance.com
+        combined_url = f"{base}/stream?streams=" + "/".join(streams)
+
         backoff = 1
         max_backoff = 60
 
         while True:
             try:
-                logger.info(f"Connecting to Binance WS for {len(self.active_symbols)} symbols "
-                            f"({len(streams)} streams): {streams}")
-                async with websockets.connect(self.ws_url) as ws:
-                    logger.info("WebSocket connected. Subscribing to streams...")
-                    await ws.send(orjson.dumps(subscribe_payload).decode('utf-8'))
-                    
+                logger.info(f"Connecting to Binance COMBINED WS for "
+                            f"{len(self.active_symbols)} symbols ({len(streams)} streams).")
+                async with websockets.connect(combined_url, max_size=2 ** 23) as ws:
+                    logger.info("Combined WebSocket connected; events flowing.")
                     backoff = 1
-                    
                     async for message in ws:
                         asyncio.create_task(self.handle_message(message))
-                        
+
             except websockets.exceptions.ConnectionClosed as e:
                 logger.warning(f"WebSocket closed: {e}. Reconnecting in {backoff}s...")
             except asyncio.CancelledError:
                 logger.info("WebSocket stream cancelled (likely for a dynamic restart).")
-                raise # Re-raise to cleanly exit the task
+                raise  # Re-raise to cleanly exit the task
             except Exception as e:
                 logger.error(f"WebSocket error: {e}. Reconnecting in {backoff}s...")
-            
+
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, max_backoff)
 
