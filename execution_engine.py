@@ -71,7 +71,10 @@ class ExecutionEngine:
                                     # Try to determine side from positionAmt (positive = long, negative = short)
                                     pos_amt = float(position_data.get('info', {}).get('positionAmt', 0))
                                     side = "LONG" if pos_amt > 0 else "SHORT"
-                                    leverage = int(position_data.get('leverage', config.DEFAULT_LEVERAGE))
+                                    
+                                    # Fallback for leverage if it's missing or None in the API response
+                                    leverage_val = position_data.get('leverage')
+                                    leverage = int(leverage_val) if leverage_val is not None else config.DEFAULT_LEVERAGE
                                     
                                     config.supabase.table("active_trades").insert({
                                         "symbol": sym,
