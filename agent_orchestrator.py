@@ -121,6 +121,13 @@ class AgentOrchestrator:
             decision = TradingDecision(**decision_dict)
             logger.info(f"[{symbol}] Gemini Decision: {decision.action} (Confidence: {decision.confidence_score}) | Reason: {decision.reasoning}")
             
+            # Always log the AI's thought process to the Dashboard so the user can see it live!
+            config.send_log_to_dashboard(
+                "AgentOrchestrator", 
+                decision.action, 
+                f"[{symbol}] Confidence: %{int(decision.confidence_score * 100)}. Reason: {decision.reasoning}"
+            )
+            
             if decision.action in ["LONG", "SHORT"] and decision.confidence_score > 0.75:
                 signal_payload = {
                     "symbol": symbol,
@@ -136,14 +143,6 @@ class AgentOrchestrator:
                     orjson.dumps(signal_payload)
                 )
                 logger.info(f"[{symbol}] Published trade signal to signals:master:{symbol}")
-                
-                # Supabase Persistence
-                if decision.confidence_score >= 0.80:
-                    config.send_log_to_dashboard(
-                        "AgentOrchestrator", 
-                        decision.action, 
-                        f"[{symbol}] Confidence: %{int(decision.confidence_score * 100)}. Reason: {decision.reasoning}"
-                    )
                 
         except Exception as e:
             logger.error(f"Error calling Gemini or processing response for {symbol}: {e}")
