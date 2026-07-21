@@ -186,7 +186,7 @@ class AgentOrchestrator:
 
                 def _insert_pending_signal():
                     try:
-                        config.supabase.table("pending_signals").insert({
+                        res = config.supabase.table("pending_signals").insert({
                             "symbol": symbol,
                             "action": sig.action,
                             "confidence": sig.confidence,
@@ -198,6 +198,21 @@ class AgentOrchestrator:
                             "status": "PENDING"
                         }).execute()
                         logger.info(f"[{symbol}] Dispatched PENDING signal to Dashboard for user approval.")
+                        
+                        signal_id = res.data[0]['id'] if res.data else str(int(time.time() * 1000))
+                        
+                        # Also notify Telegram Agent
+                        if self.redis_client:
+                            asyncio.run_coroutine_threadsafe(
+                                self.redis_client.publish("telegram:notify", orjson.dumps({
+                                    "signal_id": signal_id,
+                                    "symbol": symbol,
+                                    "action": sig.action,
+                                    "confidence": sig.confidence,
+                                    "reasoning": sig.reasoning
+                                })),
+                                asyncio.get_running_loop()
+                            )
                     except Exception as e:
                         logger.error(f"[{symbol}] Failed to insert pending signal to Supabase: {e}")
 
