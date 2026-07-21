@@ -25,6 +25,12 @@ W_MOMENTUM = float(os.getenv("W_MOMENTUM", "0.5"))
 # (tokenised equities, commodities, brand-new pairs) out of the watchlist:
 # they surge on OI but are illiquid and can lack the streams we subscribe to.
 MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "50000000"))
+# Anti-chase filter: exclude a candidate if it already moved more than this
+# percent (either direction) in the last ~4 hours. A coin that already pumped
+# or already dumped has had its move happen; OI/volume/momentum scoring alone
+# can't tell "about to explode" from "just exploded", so this hard-excludes
+# the latter instead of just letting it dominate the score.
+MAX_4H_MOVE_PCT = float(os.getenv("MAX_4H_MOVE_PCT", "20.0"))
 
 
 class MacroAgent:
@@ -70,6 +76,29 @@ class MacroAgent:
                     await asyncio.sleep(60)
         except Exception as e:
             logger.error(f"Error fetching OI for {symbol}: {e}")
+        return 0.0
+
+    async def fetch_4h_change_pct(self, ccxt_symbol: str, current_price) -> float:
+        """% price change over roughly the last 4-5 hours, via 1h candles.
+
+        Used purely as an anti-chase exclusion, not a score input: a coin
+        that already moved big (up OR down) in this window has had its
+        opportunity window already open and likely close before we could
+        react to it a 15-minute discovery cycle at a time.
+        On any fetch failure, returns 0.0 (fail-open: candidate is not
+        excluded) so a flaky API call never silently blocks discovery.
+        """
+        try:
+            ohlcv = await self.exchange.fetch_ohlcv(ccxt_symbol, timeframe='1h', limit=5)
+            if not ohlcv:
+                return 0.0
+            past_price = float(ohlcv[0][1])  # open of the oldest returned 1h candle
+            cur = float(current_price) if current_price else float(ohlcv[-1][4])
+            if past_price <= 0:
+                return 0.0
+            return (cur - past_price) / past_price * 100.0
+        except Exception as e:
+            logger.warning(f"Could not fetch 4h change for {ccxt_symbol}: {e}")
         return 0.0
 
     async def _get_narrative_bonus(self) -> dict:
@@ -118,20 +147,42 @@ class MacroAgent:
                     continue
                 candidates.append({
                     "symbol": binance_id,
+                    "ccxt_symbol": ccxt_sym,
                     "quote_volume": quote_vol,
                     "momentum": abs(float(ticker.get('percentage', 0) or 0)),
                     "last_price": ticker.get('last', 0),
                 })
 
-            # Take the top 20 by liquidity, then enrich with OI surge.
+            # Take the top 20 by liquidity, then enrich with OI surge + 4h move.
             candidates.sort(key=lambda x: x["quote_volume"], reverse=True)
             top_20 = candidates[:20]
-            logger.info("Top 20 liquidity candidates selected. Fetching OI history...")
+            logger.info("Top 20 liquidity candidates selected. Fetching OI history + 4h move...")
 
             for cand in top_20:
                 surge_pct = await self.fetch_oi_surge(cand["symbol"])
                 cand["oi_surge_pct"] = surge_pct * 100.0
+                cand["change_4h_pct"] = await self.fetch_4h_change_pct(
+                    cand["ccxt_symbol"], cand["last_price"]
+                )
                 await asyncio.sleep(0.5)  # respect REST rate limits
+
+            # Anti-chase exclusion: drop anything that already moved too much
+            # (pump or dump) in the last ~4h before it ever reaches scoring.
+            kept, dropped = [], []
+            for c in top_20:
+                if abs(c["change_4h_pct"]) > MAX_4H_MOVE_PCT:
+                    dropped.append(f"{c['symbol']}({c['change_4h_pct']:+.1f}%)")
+                else:
+                    kept.append(c)
+            if dropped:
+                logger.info(f"Excluded {len(dropped)} candidate(s) with |4h move| > "
+                            f"{MAX_4H_MOVE_PCT}%: {dropped}")
+            top_20 = kept
+
+            if not top_20:
+                logger.warning("All candidates excluded by the 4h-move filter this "
+                               "cycle; keeping previously published dynamic symbols.")
+                return
 
             # 3. Deterministic composite score (+ narrative bonus).
             bonus_map = await self._get_narrative_bonus()
@@ -155,7 +206,8 @@ class MacroAgent:
             chosen_pairs = [c["symbol"].lower() for c in chosen]
 
             detail = ", ".join(
-                f"{c['symbol']}(s={c['score']:.2f},oi={c['oi_surge_pct']:.0f}%,b={c['bonus']:.2f})"
+                f"{c['symbol']}(s={c['score']:.2f},oi={c['oi_surge_pct']:.0f}%,"
+                f"4h={c['change_4h_pct']:+.0f}%,b={c['bonus']:.2f})"
                 for c in chosen
             )
             logger.info(f"Selected satellites: {detail}")
