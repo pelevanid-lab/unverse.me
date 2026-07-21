@@ -110,7 +110,7 @@ class ExecutionEngine:
                     try:
                         # Upsert wallet data
                         config.supabase.table("wallets").upsert({
-                            "id": 1, # Fixed ID for main wallet
+                            "id": "00000000-0000-0000-0000-000000000001", # Fixed UUID for main wallet
                             "wallet_name": "Binance Futures (Main)",
                             "network": "Binance USD-M",
                             "balance": total_margin,
