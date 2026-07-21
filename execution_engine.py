@@ -57,7 +57,7 @@ class ExecutionEngine:
             positions = await self.exchange.fetch_positions()
             for pos in positions:
                 if float(pos.get('contracts', 0)) > 0:
-                    symbol = pos['symbol'].replace("/", "").replace(":", "")
+                    symbol = self._normalize_symbol(pos['symbol'])
                     self.active_positions.add(symbol)
                     logger.info(f"Found active position for {symbol}. Tracking.")
                     
@@ -131,6 +131,19 @@ class ExecutionEngine:
                 
             await asyncio.sleep(60.0) # Update every 60 seconds
             
+    def _normalize_symbol(self, ccxt_symbol: str) -> str:
+        """CCXT symbol -> Binance id.  'CRV/USDT:USDT' -> 'CRVUSDT'.
+
+        The old code did .replace('/','').replace(':','') which produced
+        'CRVUSDTUSDT' (the settlement suffix was kept), breaking symbol lookup,
+        PnL computation and journal closure for those positions.
+        """
+        try:
+            return self.exchange.market(ccxt_symbol)['id']
+        except Exception:
+            # Fallback: drop the ':SETTLE' suffix, then remove the slash.
+            return ccxt_symbol.split(':')[0].replace('/', '')
+
     def _resolve_ccxt_symbol(self, symbol: str):
         """Map a plain symbol (e.g. BTCUSDT) to the CCXT symbol (BTC/USDT:USDT)."""
         for sym in self.exchange.markets:
@@ -182,7 +195,7 @@ class ExecutionEngine:
 
                 for pos in positions:
                     if float(pos.get('contracts', 0)) > 0:
-                        sym = pos['symbol'].replace("/", "").replace(":", "")
+                        sym = self._normalize_symbol(pos['symbol'])
                         open_symbols.add(sym)
 
                 # Check for closed positions
