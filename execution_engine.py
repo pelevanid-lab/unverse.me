@@ -93,6 +93,9 @@ class ExecutionEngine:
             # Start background wallet sync
             asyncio.create_task(self.monitor_wallets())
             
+            # Start background open position monitor
+            asyncio.create_task(self.monitor_open_positions())
+            
         except Exception as e:
             logger.error(f"Failed to fetch initial positions: {e}")
             
@@ -124,6 +127,57 @@ class ExecutionEngine:
                 logger.error(f"Wallet monitor encountered an error: {e}")
                 
             await asyncio.sleep(60.0) # Update every 60 seconds
+            
+    async def monitor_open_positions(self):
+        """Periodically checks if tracked positions are closed on Binance and updates Trade History."""
+        while True:
+            try:
+                if not self.active_positions:
+                    await asyncio.sleep(10.0)
+                    continue
+                    
+                # Fetch all current positions
+                positions = await self.exchange.fetch_positions()
+                open_symbols = set()
+                
+                for pos in positions:
+                    if float(pos.get('contracts', 0)) > 0:
+                        sym = pos['symbol'].replace("/", "").replace(":", "")
+                        open_symbols.add(sym)
+                        
+                # Check for closed positions
+                closed_positions = self.active_positions - open_symbols
+                
+                for closed_sym in closed_positions:
+                    logger.info(f"[{closed_sym}] Position closed on exchange. Updating history...")
+                    self.active_positions.remove(closed_sym)
+                    
+                    if config.supabase:
+                        def _update_history(sym):
+                            try:
+                                # Mark as closed in active_trades
+                                config.supabase.table("active_trades").update({"status": "CLOSED"}).eq("symbol", sym).eq("status", "OPEN").execute()
+                                
+                                # We would ideally fetch the exact PnL from trades/orders, but as a basic implementation:
+                                # We just insert a generic closed record into trade_history
+                                config.supabase.table("trade_history").insert({
+                                    "symbol": sym,
+                                    "side": "CLOSED",
+                                    "entry_price": 0, # Requires complex order fetching to get exact exit
+                                    "exit_price": 0,
+                                    "pnl": 0, 
+                                    "date": "now()"
+                                }).execute()
+                                logger.info(f"[{sym}] Moved to Trade History on Dashboard.")
+                            except Exception as e:
+                                logger.error(f"[{sym}] Failed to update trade history: {e}")
+                                
+                        asyncio.create_task(asyncio.to_thread(_update_history, closed_sym))
+                        
+            except Exception as e:
+                logger.error(f"Error monitoring open positions: {e}")
+                
+            await asyncio.sleep(15.0) # Check every 15 seconds
 
     async def cleanup(self):
         if self.pubsub:
