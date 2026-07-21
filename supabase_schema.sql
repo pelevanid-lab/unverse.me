@@ -124,3 +124,12 @@ insert into public.bot_config (key, value) values
     ('tp_r_multiple',      '2.0'::jsonb),
     ('leverage',           '10'::jsonb)
 on conflict (key) do nothing;
+
+-- 9) htf_levels: the HTF (multi-month) support/resistance zones level_agent
+--    publishes per symbol, and the polarity role (support/resistance) each
+--    currently implies. Dashboard-visible mirror of what's cached in Redis.
+create table if not exists public.htf_levels (
+    symbol      text primary key,
+    zones       jsonb,      -- [{price_low, price_high, touches, last_touch_ts, role}, ...]
+    updated_at  timestamptz not null default now()
+);

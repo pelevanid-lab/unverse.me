@@ -314,10 +314,17 @@ def evaluate_confluence(
 
     # Narrative / sector bonus: nudges conviction in the sweep's direction only.
     sector_bonus = float(state.get("sector_bonus", 0.0) or 0.0)
-    score = raw + want * sector_bonus
+    # HTF structure bonus: this 15-min sweep coincides with a significant
+    # multi-month zone whose inferred role (support/resistance) agrees with
+    # the sweep direction (e.g. a LONG sweep right at a zone that flipped to
+    # support). Computed upstream (level_engine + agent_orchestrator) and
+    # passed in already direction-checked, so it's simply additive here.
+    structure_bonus = float(state.get("structure_bonus", 0.0) or 0.0)
+    score = raw + want * sector_bonus + want * structure_bonus
 
     contributions = {k: round(w.get(k, 0.0) * layers[k] / total_w, 4) for k in layers}
     contributions["sector_bonus"] = round(want * sector_bonus, 4)
+    contributions["structure_bonus"] = round(want * structure_bonus, 4)
 
     passes = (n_confirm >= MIN_CONFIRMATIONS) and (abs(score) >= CONFLUENCE_THRESHOLD) \
         and (score * want > 0)
@@ -349,7 +356,8 @@ def evaluate_confluence(
     confidence = min(abs(score), 1.0)
     reason = (f"{direction} confluence {score:+.2f} | confirms: {'+'.join(confirmers) or 'none'} "
               f"| flow {orderflow:+.2f} trend {trend:+.2f} rsi {rsi_val:.0f} "
-              f"bonus {sector_bonus:.2f} | SL {sl:.6g} TP {tp:.6g} @ {tp_r_multiple}R.")
+              f"sector {sector_bonus:.2f} structure {structure_bonus:.2f} "
+              f"| SL {sl:.6g} TP {tp:.6g} @ {tp_r_multiple}R.")
     return Signal(direction, confidence, score, contributions=contributions,
                   reasoning=reason, sl_price=sl, tp_price=tp)
 

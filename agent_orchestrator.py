@@ -10,10 +10,17 @@ from supabase import create_client, Client
 
 import config
 import signal_engine
+import level_engine
 
 # Only dispatch signals whose conviction clears this floor. This is the second
 # gate on top of signal_engine's own entry threshold.
 MIN_CONFIDENCE = float(os.getenv("MIN_SIGNAL_CONFIDENCE", "0.55"))
+
+# HTF structure bonus: how close price must be to a zone to count as "at" it,
+# and the max bonus a maximally-significant zone (many touches) can add.
+ZONE_PROXIMITY_PCT = float(os.getenv("ZONE_PROXIMITY_PCT", "0.02"))
+STRUCTURE_BONUS_MAX = float(os.getenv("STRUCTURE_BONUS_MAX", "0.30"))
+STRUCTURE_BONUS_TOUCHES_NORM = float(os.getenv("STRUCTURE_BONUS_TOUCHES_NORM", "5.0"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -116,7 +123,63 @@ class AgentOrchestrator:
         except (KeyError, ValueError) as e:
             logger.error(f"Error updating state for channel {channel}: {e}")
 
-    def _evaluate_symbol(self, symbol: str, current_state: dict):
+    async def _get_structure_bonus(self, symbol: str, current_state: dict):
+        """Look up this symbol's HTF zones (published by level_agent) and, if
+        the current sweep direction agrees with a nearby zone's inferred role
+        (e.g. a LONG sweep right at a zone that flipped to support), return a
+        bonus scaled by how significant (multi-touch) that zone is.
+
+        Returns (bonus: float, zone_info: dict|None) — zone_info is logged
+        into the signal's features so learn.py can later correlate HTF-zone
+        alignment with realised PnL, same as the narrative sector_bonus.
+        """
+        if not self.redis_client:
+            return 0.0, None
+        try:
+            raw = await self.redis_client.get(f"levels:zones:{symbol}")
+        except Exception as e:
+            logger.warning(f"[{symbol}] Could not read HTF zones: {e}")
+            return 0.0, None
+        if not raw:
+            return 0.0, None
+
+        try:
+            zone_dicts = orjson.loads(raw)
+        except Exception:
+            return 0.0, None
+        if not zone_dicts:
+            return 0.0, None
+
+        zones = [level_engine.Zone(
+            price_low=z["price_low"], price_high=z["price_high"],
+            touches=z["touches"], last_touch_ts=z.get("last_touch_ts", 0),
+        ) for z in zone_dicts]
+
+        price = float(current_state.get("last_price", 0) or 0)
+        if price <= 0:
+            return 0.0, None
+
+        zone = level_engine.nearest_zone(zones, price, max_distance_pct=ZONE_PROXIMITY_PCT)
+        if not zone:
+            return 0.0, None
+
+        role = next((z["role"] for z in zone_dicts
+                     if z["price_low"] == zone.price_low and z["price_high"] == zone.price_high),
+                    None)
+
+        sweep_low = bool(current_state.get("sweep_low"))
+        sweep_high = bool(current_state.get("sweep_high"))
+        aligned = (sweep_low and role == "support") or (sweep_high and role == "resistance")
+
+        zone_info = {"zone_low": zone.price_low, "zone_high": zone.price_high,
+                     "touches": zone.touches, "role": role, "aligned": aligned}
+        if not aligned:
+            return 0.0, zone_info
+
+        bonus = min(zone.touches / STRUCTURE_BONUS_TOUCHES_NORM, 1.0) * STRUCTURE_BONUS_MAX
+        return bonus, zone_info
+
+    async def _evaluate_symbol(self, symbol: str, current_state: dict):
         """Deterministic decision for a symbol using our own signal engine.
 
         No LLM: the same input always yields the same output, which is what
@@ -127,6 +190,10 @@ class AgentOrchestrator:
 
         # Inject the current narrative/sector bonus for this symbol.
         current_state["sector_bonus"] = self.narrative_map.get(symbol, 0.0)
+
+        # Inject the HTF structure bonus (multi-month zone alignment).
+        structure_bonus, htf_zone_info = await self._get_structure_bonus(symbol, current_state)
+        current_state["structure_bonus"] = structure_bonus
 
         # Pick the strategy (default: 5-layer confluence).
         if config.STRATEGY == "confluence":
@@ -178,6 +245,8 @@ class AgentOrchestrator:
                     "rsi": current_state.get("rsi"),
                     "atr": current_state.get("atr"),
                     "sector_bonus": current_state.get("sector_bonus"),
+                    "structure_bonus": current_state.get("structure_bonus"),
+                    "htf_zone": htf_zone_info,
                     "layer_contributions": sig.contributions,
                     # structure-based bracket the execution engine should honour
                     "sl_price": sig.sl_price,
@@ -263,7 +332,7 @@ class AgentOrchestrator:
 
                         # Snapshot the state and evaluate deterministically (cheap, local)
                         state_snapshot = state.copy()
-                        self._evaluate_symbol(sym_upper, state_snapshot)
+                        await self._evaluate_symbol(sym_upper, state_snapshot)
                         
             except Exception as e:
                 logger.error(f"Error in evaluate_triggers loop: {e}")
