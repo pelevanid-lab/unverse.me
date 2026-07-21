@@ -33,5 +33,33 @@ SL_PCT = float(os.getenv("SL_PCT", "0.015"))
 TP_PCT = float(os.getenv("TP_PCT", "0.03"))
 
 # Supabase Configuration
+import asyncio
+from supabase import create_client, Client
+
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+
+supabase: Client = None
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as e:
+        print(f"Supabase init error: {e}")
+
+def send_log_to_dashboard(agent_name: str, action: str, message: str):
+    if supabase:
+        def _insert():
+            try:
+                supabase.table("agent_logs").insert({
+                    "agent_name": agent_name,
+                    "action": action,
+                    "message": message
+                }).execute()
+            except Exception as e:
+                pass
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(asyncio.to_thread(_insert))
+        except RuntimeError:
+            pass # No running event loop
+

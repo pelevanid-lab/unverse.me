@@ -30,12 +30,6 @@ class MacroAgent:
         self.session = None
         self.run_interval = 900 # 15 minutes
         
-        if config.SUPABASE_URL and config.SUPABASE_KEY:
-            self.supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
-        else:
-            self.supabase = None
-        
-        
         self.model = genai.GenerativeModel(
             model_name="gemini-2.5-flash",
             generation_config=genai.GenerationConfig(
@@ -165,14 +159,7 @@ class MacroAgent:
             logger.info("Published dynamic symbols to control channel.")
             
             # 6. Supabase Persistence
-            if self.supabase:
-                try:
-                    def _insert_macro():
-                        self.supabase.table("macro_trends").insert({"pairs": chosen_pairs}).execute()
-                    asyncio.create_task(asyncio.to_thread(_insert_macro))
-                    logger.info("Dispatched Supabase insert for macro_trends.")
-                except Exception as e:
-                    logger.error(f"Failed to dispatch Supabase insert: {e}")
+            config.send_log_to_dashboard("MacroAgent", "DISCOVERY", f"Selected explosive satellite pairs: {chosen_pairs}")
             
         except Exception as e:
             logger.error(f"Error in Macro Discovery Cycle: {e}")

@@ -32,11 +32,6 @@ class AgentOrchestrator:
         self.redis_client: Optional[redis.Redis] = None
         self.pubsub = None
         
-        if config.SUPABASE_URL and config.SUPABASE_KEY:
-            self.supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
-        else:
-            self.supabase = None
-        
         # State: In-memory numerical state per symbol
         # { "BTCUSDT": {"cvd_1m": 0, "cvd_5m": 0, "imbalance": 0.5, "mark_price": 0.0} }
         self.state: Dict[str, Dict[str, float]] = {
@@ -143,19 +138,12 @@ class AgentOrchestrator:
                 logger.info(f"[{symbol}] Published trade signal to signals:master:{symbol}")
                 
                 # Supabase Persistence
-                if self.supabase and decision.confidence_score >= 0.80:
-                    try:
-                        def _insert_signal():
-                            self.supabase.table("active_signals").insert({
-                                "symbol": symbol,
-                                "signal_type": decision.action,
-                                "confidence": decision.confidence_score,
-                                "reasoning": decision.reasoning
-                            }).execute()
-                        asyncio.create_task(asyncio.to_thread(_insert_signal))
-                        logger.info(f"[{symbol}] Dispatched Supabase insert for active_signals.")
-                    except Exception as e:
-                        logger.error(f"[{symbol}] Failed to dispatch Supabase insert: {e}")
+                if decision.confidence_score >= 0.80:
+                    config.send_log_to_dashboard(
+                        "AgentOrchestrator", 
+                        decision.action, 
+                        f"[{symbol}] Confidence: %{int(decision.confidence_score * 100)}. Reason: {decision.reasoning}"
+                    )
                 
         except Exception as e:
             logger.error(f"Error calling Gemini or processing response for {symbol}: {e}")

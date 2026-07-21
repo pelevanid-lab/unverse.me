@@ -20,11 +20,6 @@ class ExecutionEngine:
         self.redis_client = None
         self.pubsub = None
         
-        if config.SUPABASE_URL and config.SUPABASE_KEY:
-            self.supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
-        else:
-            self.supabase = None
-        
         # Local tracker to prevent duplicate entries
         self.active_positions: Set[str] = set()
         
@@ -194,19 +189,22 @@ class ExecutionEngine:
             )
             
             # 7. Supabase Persistence
-            if self.supabase:
-                try:
-                    def _insert_trade():
-                        self.supabase.table("trade_logs").insert({
+            if config.supabase:
+                def _insert_trade():
+                    try:
+                        config.supabase.table("active_trades").insert({
                             "symbol": symbol,
                             "side": action,
                             "entry_price": current_price,
+                            "leverage": config.DEFAULT_LEVERAGE,
+                            "quantity": calculated_qty,
                             "status": "OPEN"
                         }).execute()
-                    asyncio.create_task(asyncio.to_thread(_insert_trade))
-                    logger.info(f"[{symbol}] Dispatched Supabase insert for trade_logs.")
-                except Exception as e:
-                    logger.error(f"[{symbol}] Failed to dispatch Supabase insert: {e}")
+                    except Exception as e:
+                        logger.error(f"[{symbol}] Failed to dispatch Supabase insert: {e}")
+                asyncio.create_task(asyncio.to_thread(_insert_trade))
+                
+            config.send_log_to_dashboard("ExecutionEngine", "TRADE_OPENED", f"[{symbol}] Opened {action} with {calculated_qty} qty at {current_price}.")
             
         except Exception as e:
             logger.error(f"[{symbol}] Execution Pipeline Failed: {e}")
