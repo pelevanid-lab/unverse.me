@@ -8,7 +8,10 @@ import {
   History, 
   Wallet, 
   TrendingUp,
-  TerminalSquare
+  TerminalSquare,
+  CheckCircle,
+  XCircle,
+  Clock
 } from "lucide-react";
 import { format } from "date-fns";
 
@@ -17,6 +20,7 @@ export default function Dashboard() {
   const [activeTrades, setActiveTrades] = useState<any[]>([]);
   const [history, setHistory] = useState<any[]>([]);
   const [wallets, setWallets] = useState<any[]>([]);
+  const [pendingSignals, setPendingSignals] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -29,21 +33,41 @@ export default function Dashboard() {
   const fetchData = async () => {
     try {
       // Supabase'den verileri eşzamanlı çekiyoruz
-      const [logsRes, tradesRes, historyRes, walletsRes] = await Promise.all([
+      const [logsRes, tradesRes, historyRes, walletsRes, pendingRes] = await Promise.all([
         supabase.from("agent_logs").select("*").order("created_at", { ascending: false }).limit(20),
         supabase.from("active_trades").select("*").eq("status", "OPEN").order("created_at", { ascending: false }),
         supabase.from("trade_history").select("*").order("closed_at", { ascending: false }).limit(50),
-        supabase.from("wallets").select("*").order("updated_at", { ascending: false })
+        supabase.from("wallets").select("*").order("updated_at", { ascending: false }),
+        supabase.from("pending_signals").select("*").eq("status", "PENDING").order("created_at", { ascending: false })
       ]);
 
       if (logsRes.data) setLogs(logsRes.data);
       if (tradesRes.data) setActiveTrades(tradesRes.data);
       if (historyRes.data) setHistory(historyRes.data);
       if (walletsRes.data) setWallets(walletsRes.data);
+      if (pendingRes.data) setPendingSignals(pendingRes.data);
     } catch (error) {
       console.error("Data fetch error:", error);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleApprove = async (id: string) => {
+    try {
+      await supabase.from("pending_signals").update({ status: "APPROVED" }).eq("id", id);
+      fetchData(); // refresh list
+    } catch (error) {
+      console.error("Error approving signal:", error);
+    }
+  };
+
+  const handleReject = async (id: string) => {
+    try {
+      await supabase.from("pending_signals").update({ status: "REJECTED" }).eq("id", id);
+      fetchData(); // refresh list
+    } catch (error) {
+      console.error("Error rejecting signal:", error);
     }
   };
 
@@ -104,6 +128,45 @@ export default function Dashboard() {
           {/* LEFT COLUMN: ACTIVE TRADES & WALLETS */}
           <div className="xl:col-span-2 flex flex-col gap-8">
             
+            {/* PENDING APPROVALS */}
+            {pendingSignals.length > 0 && (
+              <div className="bg-gradient-to-r from-amber-500/10 to-orange-500/10 border border-amber-500/30 rounded-xl p-6 shadow-[0_0_15px_rgba(245,158,11,0.1)]">
+                <div className="flex items-center gap-2 mb-6">
+                  <Clock className="text-amber-500" size={24}/>
+                  <h2 className="text-xl font-bold text-amber-500">Pending Approvals</h2>
+                  <span className="ml-2 bg-amber-500 text-black text-xs font-bold px-2 py-1 rounded-full">{pendingSignals.length}</span>
+                </div>
+                <div className="grid grid-cols-1 gap-4">
+                  {pendingSignals.map(signal => (
+                    <div key={signal.id} className="bg-[#0f111a] border border-amber-500/20 rounded-lg p-5 flex flex-col md:flex-row justify-between md:items-center gap-4">
+                      <div>
+                        <div className="flex items-center gap-3 mb-2">
+                          <span className="text-lg font-bold text-white">{signal.symbol}</span>
+                          <span className={`px-2 py-1 rounded text-xs font-bold ${signal.action === 'LONG' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>
+                            {signal.action}
+                          </span>
+                          <span className="text-xs text-amber-400 font-bold border border-amber-400/30 px-2 py-1 rounded">
+                            AI Confidence: {Math.round(signal.confidence * 100)}%
+                          </span>
+                        </div>
+                        <p className="text-slate-400 text-sm">{signal.reasoning}</p>
+                      </div>
+                      <div className="flex items-center gap-3 shrink-0">
+                        <button onClick={() => handleReject(signal.id)} className="flex items-center gap-2 px-4 py-2 bg-rose-500/10 hover:bg-rose-500/20 text-rose-500 border border-rose-500/30 rounded-lg font-bold transition">
+                          <XCircle size={18} />
+                          Reject
+                        </button>
+                        <button onClick={() => handleApprove(signal.id)} className="flex items-center gap-2 px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-white shadow-lg shadow-emerald-500/20 rounded-lg font-bold transition">
+                          <CheckCircle size={18} />
+                          Approve Trade
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* ACTIVE TRADES */}
             <div id="active-positions" className="bg-[#1a1d2d] border border-slate-800 rounded-xl p-6 scroll-mt-6">
               <div className="flex items-center gap-2 mb-6">

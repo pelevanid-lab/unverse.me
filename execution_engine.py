@@ -42,9 +42,7 @@ class ExecutionEngine:
     async def initialize(self):
         logger.info(f"Connecting to Redis at {config.REDIS_URL}")
         self.redis_client = redis.from_url(config.REDIS_URL, decode_responses=False)
-        self.pubsub = self.redis_client.pubsub()
-        await self.pubsub.psubscribe("signals:master:*")
-        logger.info("Subscribed to signals:master:* channels.")
+        # We no longer subscribe to signals:master:* because we rely on Supabase manual approval
         
         # Load markets for precision formatting
         await self.exchange.load_markets()
@@ -180,8 +178,6 @@ class ExecutionEngine:
             await asyncio.sleep(15.0) # Check every 15 seconds
 
     async def cleanup(self):
-        if self.pubsub:
-            await self.pubsub.close()
         if self.redis_client:
             await self.redis_client.aclose()
         if self.exchange:
@@ -328,42 +324,46 @@ class ExecutionEngine:
         except Exception as e:
             logger.error(f"[{symbol}] Execution Pipeline Failed: {e}")
 
-    async def listen_to_signals(self):
-        """Listen to incoming Redis AI signals and act on them."""
+    async def monitor_pending_approvals(self):
+        """Poll Supabase for signals that have been manually approved by the user."""
+        logger.info("Starting Pending Approvals monitor loop...")
         while True:
             try:
-                message = await self.pubsub.get_message(ignore_subscribe_messages=True, timeout=0.1)
-                if message and message['type'] == 'pmessage':
-                    channel = message['channel'].decode('utf-8')
-                    symbol = channel.split(":")[-1]
-                    data = orjson.loads(message['data'])
-                    
-                    action = data.get("action", "WAIT")
-                    confidence = float(data.get("confidence_score", 0.0))
-                    
-                    # 1. Filter Check
-                    if action in ["LONG", "SHORT"] and confidence >= 0.75:
-                        # 2. Position Check
-                        if symbol in self.active_positions:
-                            logger.info(f"[{symbol}] Ignoring valid {action} signal. Active position already exists.")
-                            continue
-                            
-                        logger.info(f"[{symbol}] Received valid master signal: {action} (Confidence: {confidence}). Initiating execution.")
+                if config.supabase:
+                    def _fetch_approved():
+                        return config.supabase.table("pending_signals").select("*").eq("status", "APPROVED").execute()
                         
-                        # 3. Fire Execution Task (Background)
-                        asyncio.create_task(self.execute_trade(symbol, action))
-                else:
-                    await asyncio.sleep(0.01)
+                    res = await asyncio.to_thread(_fetch_approved)
+                    if res.data:
+                        for signal in res.data:
+                            symbol = signal['symbol']
+                            action = signal['action']
+                            signal_id = signal['id']
+                            
+                            logger.info(f"[{symbol}] Found USER APPROVED signal for {action}! Initiating execution.")
+                            
+                            # 1. Update status to EXECUTING to prevent double-execution
+                            def _mark_executing():
+                                config.supabase.table("pending_signals").update({"status": "EXECUTED"}).eq("id", signal_id).execute()
+                            await asyncio.to_thread(_mark_executing)
+                            
+                            # 2. Fire Execution Task (Background)
+                            if symbol not in self.active_positions:
+                                asyncio.create_task(self.execute_trade(symbol, action))
+                            else:
+                                logger.info(f"[{symbol}] Ignoring approved {action} signal. Active position already exists.")
+                                
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error reading message from Redis: {e}")
-                await asyncio.sleep(1)
+                logger.error(f"Error checking pending approvals: {e}")
+                
+            await asyncio.sleep(2.0) # Check every 2 seconds
 
     async def run(self):
         await self.initialize()
         try:
-            await self.listen_to_signals()
+            await self.monitor_pending_approvals()
         finally:
             await self.cleanup()
 

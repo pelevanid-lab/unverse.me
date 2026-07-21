@@ -129,20 +129,23 @@ class AgentOrchestrator:
             )
             
             if decision.action in ["LONG", "SHORT"] and decision.confidence_score > 0.75:
-                signal_payload = {
-                    "symbol": symbol,
-                    "action": decision.action,
-                    "confidence_score": decision.confidence_score,
-                    "reasoning": decision.reasoning,
-                    "trigger_state": current_state,
-                    "timestamp": int(time.time() * 1000)
-                }
+                logger.info(f"[{symbol}] Generating Pending Approval for {decision.action} signal.")
                 
-                await self.redis_client.publish(
-                    f"signals:master:{symbol}",
-                    orjson.dumps(signal_payload)
-                )
-                logger.info(f"[{symbol}] Published trade signal to signals:master:{symbol}")
+                if config.supabase:
+                    def _insert_pending_signal():
+                        try:
+                            config.supabase.table("pending_signals").insert({
+                                "symbol": symbol,
+                                "action": decision.action,
+                                "confidence": decision.confidence_score,
+                                "reasoning": decision.reasoning,
+                                "status": "PENDING"
+                            }).execute()
+                            logger.info(f"[{symbol}] Dispatched PENDING signal to Dashboard for user approval.")
+                        except Exception as e:
+                            logger.error(f"[{symbol}] Failed to insert pending signal to Supabase: {e}")
+                    
+                    asyncio.create_task(asyncio.to_thread(_insert_pending_signal))
                 
         except Exception as e:
             logger.error(f"Error calling Gemini or processing response for {symbol}: {e}")
