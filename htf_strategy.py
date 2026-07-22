@@ -446,6 +446,10 @@ def evaluate_htf_breakout(
     zone_cluster_tol_pct: float = 0.02,
     zone_min_touches: int = 2,
     min_close_strength: float = 0.55,
+    max_atr_pct: float = 0.25,
+    spent_lookback_days: int = 30,
+    spent_drop_pct: float = 0.70,
+    spent_rise_mult: float = 3.0,
 ) -> HTFSignal:
     """Evaluate the last CLOSED daily and 3-day candles for a confirmed HTF
     trend breakout.
@@ -471,7 +475,24 @@ def evaluate_htf_breakout(
     if atr_1d <= 0:
         return HTFSignal("WAIT", reasoning="Degenerate daily ATR.")
 
-    # --- HTF structure: zones from daily AND 3-day candles, merged ---------
+    # --- ATR sanity gate: post-collapse/parabola distortion ----------------
+    # After a violent repricing (LABUSDT 2026-07-22: 24 -> 0.15, i.e. -99%),
+    # Wilder ATR(14) still remembers the crash candles and can exceed the
+    # PRICE ITSELF by an order of magnitude (LAB: ATR/price = 1309%). Every
+    # ATR-denominated check then silently degenerates: the anti-chase filter
+    # reads "0.0 ATR extended" for any distance, the 1.5-ATR stop floor
+    # demands an impossible stop and the 15% cap silently takes over, and
+    # sweep depths become meaningless. When the volatility yardstick no
+    # longer describes current price action, NOTHING here is measurable —
+    # so trade nothing.
+    atr_pct = atr_1d / current_price
+    if atr_pct > max_atr_pct:
+        return HTFSignal(
+            "WAIT",
+            reasoning=(f"ATR is {atr_pct:.0%} of price (> {max_atr_pct:.0%}): a recent "
+                       "collapse/parabola has distorted the volatility yardstick, so "
+                       "extension, stop sizing and sweep depth are all unmeasurable — skipped."),
+        )
     zones: List[Zone] = build_htf_zones(bars_1d, bars_3d, zone_cluster_tol_pct, zone_min_touches)
 
     # --- Trigger candidates, in priority order ------------------------------
@@ -557,6 +578,33 @@ def evaluate_htf_breakout(
             nonlocal first_reject
             if first_reject is None:
                 first_reject = msg
+
+        # --- Filter 0: is there anything left to capture? --------------------
+        # A continuation trade needs a move that hasn't already happened.
+        # SHORTing after price lost 70%+ of its N-day high (LAB: -99.2%) has
+        # dust for remaining downside and violent dead-cat-bounce risk;
+        # LONGing after price already multiplied off its N-day low is buying
+        # the blow-off (BANK 07-20: entry at 9.5x the 30d low, stopped out).
+        # Deviation triggers are exempt — they're reversal reads, entered AT
+        # the extreme by design, not chasing away from it.
+        if trigger_type != "deviation":
+            recent = bars_1d[-spent_lookback_days:]
+            if direction == "SHORT":
+                hi_n = max(b.high for b in recent)
+                drop = (hi_n - current_price) / hi_n if hi_n > 0 else 0.0
+                if drop > spent_drop_pct:
+                    _reject(f"SHORT rejected: price already {drop:.0%} below its "
+                            f"{spent_lookback_days}d high — the move is spent, only "
+                            "bounce risk remains.")
+                    continue
+            else:
+                lo_n = min(b.low for b in recent)
+                rise = current_price / lo_n if lo_n > 0 else 1.0
+                if rise > spent_rise_mult:
+                    _reject(f"LONG rejected: price already {rise:.1f}x its "
+                            f"{spent_lookback_days}d low (> {spent_rise_mult:.1f}x) — "
+                            "chasing a blow-off.")
+                    continue
 
         # --- Filter 1: trend regime must not oppose the trade ---------------
         # Deviation triggers are exempt from the hard block: a sweep-reclaim

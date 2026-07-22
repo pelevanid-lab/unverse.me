@@ -358,6 +358,10 @@ class HTFAgent:
                 sl_zone_atr_mult=config.HTF_SL_ZONE_ATR_MULT,
                 min_sl_atr_mult=config.HTF_MIN_SL_ATR_MULT,
                 max_sl_pct=config.HTF_MAX_SL_PCT,
+                max_atr_pct=config.HTF_MAX_ATR_PCT,
+                spent_lookback_days=config.HTF_SPENT_LOOKBACK_DAYS,
+                spent_drop_pct=config.HTF_SPENT_DROP_PCT,
+                spent_rise_mult=config.HTF_SPENT_RISE_MULT,
             )
             # Mark AFTER a successful evaluation so a transient fetch error
             # above gets retried on the next scan instead of this daily/3-day
@@ -815,6 +819,10 @@ class HTFAgent:
                 sl_zone_atr_mult=config.HTF_SL_ZONE_ATR_MULT,
                 min_sl_atr_mult=config.HTF_MIN_SL_ATR_MULT,
                 max_sl_pct=config.HTF_MAX_SL_PCT,
+                max_atr_pct=config.HTF_MAX_ATR_PCT,
+                spent_lookback_days=config.HTF_SPENT_LOOKBACK_DAYS,
+                spent_drop_pct=config.HTF_SPENT_DROP_PCT,
+                spent_rise_mult=config.HTF_SPENT_RISE_MULT,
             )
             squeeze = htf_strategy.squeeze_ratio(
                 bars_1d, config.HTF_SQUEEZE_RECENT_DAYS, config.HTF_SQUEEZE_BASELINE_DAYS)

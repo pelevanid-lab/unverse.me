@@ -72,6 +72,17 @@ HTF_MAX_EXTENSION_ATR = float(os.getenv("HTF_MAX_EXTENSION_ATR", "1.5"))  # anti
 HTF_SL_ZONE_ATR_MULT = float(os.getenv("HTF_SL_ZONE_ATR_MULT", "1.0"))
 HTF_MIN_SL_ATR_MULT = float(os.getenv("HTF_MIN_SL_ATR_MULT", "1.5"))   # stop floor
 HTF_MAX_SL_PCT = float(os.getenv("HTF_MAX_SL_PCT", "0.15"))            # sanity cap 15%
+# Post-collapse sanity (the LABUSDT 2026-07-22 lesson): when ATR(14,1d)
+# exceeds this fraction of price, a recent collapse/parabola has distorted
+# every ATR-based measure (LAB: ATR/price was 1309%) — trade nothing there.
+HTF_MAX_ATR_PCT = float(os.getenv("HTF_MAX_ATR_PCT", "0.25"))
+# Spent-move guard: no continuation SHORT after price lost this much of its
+# N-day high (only dust + dead-cat-bounce risk remains), no continuation
+# LONG at more than this multiple of the N-day low (blow-off chasing).
+# Deviation (reversal) triggers are exempt by design.
+HTF_SPENT_LOOKBACK_DAYS = int(os.getenv("HTF_SPENT_LOOKBACK_DAYS", "30"))
+HTF_SPENT_DROP_PCT = float(os.getenv("HTF_SPENT_DROP_PCT", "0.70"))
+HTF_SPENT_RISE_MULT = float(os.getenv("HTF_SPENT_RISE_MULT", "3.0"))
 HTF_TRAIL_ATR_MULT = float(os.getenv("HTF_TRAIL_ATR_MULT", "3.0"))     # chandelier (4h ATR)
 HTF_BREAKEVEN_R = float(os.getenv("HTF_BREAKEVEN_R", "1.5"))
 HTF_SIGNAL_COOLDOWN_HOURS = float(os.getenv("HTF_SIGNAL_COOLDOWN_HOURS", "24"))
