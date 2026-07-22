@@ -8,6 +8,7 @@ import redis.asyncio as redis
 from supabase import create_client, Client
 
 import config
+from level_engine import Candle, detect_coiling_pattern
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,6 +22,14 @@ MAX_DYNAMIC_SYMBOLS = int(os.getenv("MAX_DYNAMIC_SYMBOLS", "3"))
 W_OI_SURGE = float(os.getenv("W_OI_SURGE", "1.0"))
 W_VOLUME = float(os.getenv("W_VOLUME", "0.6"))
 W_MOMENTUM = float(os.getenv("W_MOMENTUM", "0.5"))
+# Cross-sectional pattern bonus: coins currently "coiling" (descending
+# resistance trendline compressing into a horizontal support zone -- the
+# repeating setup a discretionary trader scans for across many charts at
+# once, e.g. "UNI/CVX/CRV: all chart similar and same triggers"). A
+# heuristic prioritisation signal, not proof of a coming breakout.
+W_COILING = float(os.getenv("W_COILING", "0.5"))
+COIL_CANDLE_TIMEFRAME = os.getenv("COIL_CANDLE_TIMEFRAME", "4h")
+COIL_CANDLE_LIMIT = int(os.getenv("COIL_CANDLE_LIMIT", "60"))  # ~10 days of 4h candles
 # Minimum 24h quote volume for a candidate. Keeps thin / exotic listings
 # (tokenised equities, commodities, brand-new pairs) out of the watchlist:
 # they surge on OI but are illiquid and can lack the streams we subscribe to.
@@ -101,6 +110,30 @@ class MacroAgent:
             logger.warning(f"Could not fetch 4h change for {ccxt_symbol}: {e}")
         return 0.0
 
+    async def fetch_coiling_score(self, ccxt_symbol: str) -> float:
+        """Scan for a "coiling into support under a descending trendline"
+        pattern -- the repeating cross-coin setup a discretionary trader
+        watches for across many charts at once (e.g. "all chart similar and
+        same triggers"). Returns a 0..1 match score: 1.0 if actively coiling
+        right now, 0.5 if the shape exists but price isn't in the zone yet,
+        0.0 if no such setup is present. On any failure, fails open at 0.0
+        (never blocks discovery).
+        """
+        try:
+            ohlcv = await self.exchange.fetch_ohlcv(
+                ccxt_symbol, timeframe=COIL_CANDLE_TIMEFRAME, limit=COIL_CANDLE_LIMIT
+            )
+            if not ohlcv or len(ohlcv) < 10:
+                return 0.0
+            candles = [Candle(ts=r[0], open=r[1], high=r[2], low=r[3], close=r[4]) for r in ohlcv]
+            result = detect_coiling_pattern(candles)
+            if not result:
+                return 0.0
+            return 1.0 if result["is_coiling"] else 0.5
+        except Exception as e:
+            logger.warning(f"Could not run coiling scan for {ccxt_symbol}: {e}")
+            return 0.0
+
     async def _get_narrative_bonus(self) -> dict:
         """Read the narrative agent's {SYMBOL: bonus} map from Redis (if any)."""
         try:
@@ -164,6 +197,7 @@ class MacroAgent:
                 cand["change_4h_pct"] = await self.fetch_4h_change_pct(
                     cand["ccxt_symbol"], cand["last_price"]
                 )
+                cand["coiling_score"] = await self.fetch_coiling_score(cand["ccxt_symbol"])
                 await asyncio.sleep(0.5)  # respect REST rate limits
 
             # Anti-chase exclusion: drop anything that already moved too much
@@ -198,6 +232,7 @@ class MacroAgent:
                     W_OI_SURGE * oi_norm(c["oi_surge_pct"])
                     + W_VOLUME * vol_norm(math.log10(c["quote_volume"] + 1))
                     + W_MOMENTUM * mom_norm(c["momentum"])
+                    + W_COILING * c["coiling_score"]  # cross-sectional pattern scan
                     + bonus  # narrative/sector boost
                 )
 
@@ -207,7 +242,7 @@ class MacroAgent:
 
             detail = ", ".join(
                 f"{c['symbol']}(s={c['score']:.2f},oi={c['oi_surge_pct']:.0f}%,"
-                f"4h={c['change_4h_pct']:+.0f}%,b={c['bonus']:.2f})"
+                f"4h={c['change_4h_pct']:+.0f}%,coil={c['coiling_score']:.1f},b={c['bonus']:.2f})"
                 for c in chosen
             )
             logger.info(f"Selected satellites: {detail}")

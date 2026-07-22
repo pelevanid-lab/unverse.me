@@ -198,3 +198,79 @@ def nearest_zone(zones: Sequence[Zone], price: float, max_distance_pct: float = 
     if not candidates:
         return None
     return max(candidates, key=lambda z: z.touches)
+
+
+def fit_trendline(points: Sequence[float]) -> Optional[Tuple[float, float]]:
+    """Least-squares line fit (slope, intercept) through evenly-spaced y
+    values (x = 0..n-1 index, so slope is in "price per pivot-step" units,
+    not tied to raw timestamps). Returns None if fewer than 2 points or a
+    degenerate (zero-variance) x range.
+    """
+    n = len(points)
+    if n < 2:
+        return None
+    xs = list(range(n))
+    mean_x = sum(xs) / n
+    mean_y = sum(points) / n
+    cov = sum((xs[i] - mean_x) * (points[i] - mean_y) for i in range(n))
+    var = sum((x - mean_x) ** 2 for x in xs)
+    if var == 0:
+        return None
+    slope = cov / var
+    intercept = mean_y - slope * mean_x
+    return slope, intercept
+
+
+def detect_coiling_pattern(
+    candles: Sequence[Candle],
+    pivot_window: int = 3,
+    lookback_pivots: int = 5,
+    proximity_pct: float = 0.03,
+    min_touches: int = 2,
+) -> Optional[dict]:
+    """Detect "coiling into support under a descending trendline" — a
+    recurring cross-coin setup: falling highs (a descending resistance
+    trendline) compressing down toward a flat/horizontal support zone below.
+    This is a WATCHLIST pattern (compression before a breakout/breakdown),
+    not a trade trigger by itself — it flags candidates worth scanning the
+    same way a discretionary trader groups several charts as "same triggers."
+
+    Returns a dict describing the setup (trendline price + slope, nearby
+    zone, whether price is currently coiling between them) or None if no
+    descending trendline / nearby zone is found. A genuine caveat: fitting a
+    line through a handful of pivots on volatile crypto data can produce
+    false positives — this is a heuristic prioritisation signal, not proof
+    of a coming breakout.
+    """
+    high_idx, _ = _find_pivots(candles, pivot_window)
+    if len(high_idx) < 3:
+        return None
+
+    recent_idx = high_idx[-lookback_pivots:]
+    recent_highs = [candles[i].high for i in recent_idx]
+    fit = fit_trendline(recent_highs)
+    if not fit:
+        return None
+    slope, intercept = fit
+    if slope >= 0:
+        return None  # rising/flat highs -> not a descending-resistance coil
+
+    n = len(recent_highs)
+    trendline_now = slope * (n - 1) + intercept  # extrapolate to the latest pivot used
+
+    zones = detect_zones(candles, pivot_window=pivot_window, min_touches=min_touches)
+    current_price = candles[-1].close
+    zone = nearest_zone(zones, current_price, max_distance_pct=proximity_pct)
+    if not zone:
+        return None
+
+    is_coiling = zone.price_high <= current_price <= trendline_now * (1 + proximity_pct)
+
+    return {
+        "trendline_price": trendline_now,
+        "trendline_slope": slope,
+        "zone_low": zone.price_low,
+        "zone_high": zone.price_high,
+        "zone_touches": zone.touches,
+        "is_coiling": is_coiling,
+    }
