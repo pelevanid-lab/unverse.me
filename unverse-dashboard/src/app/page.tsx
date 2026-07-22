@@ -12,7 +12,9 @@ import {
   CheckCircle,
   XCircle,
   Clock,
-  Sparkles
+  Sparkles,
+  RefreshCw,
+  Search
 } from "lucide-react";
 import { format } from "date-fns";
 
@@ -25,6 +27,16 @@ export default function Dashboard() {
   const [narrative, setNarrative] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [authError, setAuthError] = useState("");
+
+  // Manual scan trigger + on-demand symbol analysis (same commands
+  // Telegram's /tara and plain-text-symbol flow use, routed through
+  // Supabase's dashboard_commands table since Redis isn't reachable from
+  // the dashboard's serverless functions).
+  const [scanTriggering, setScanTriggering] = useState(false);
+  const [scanMsg, setScanMsg] = useState("");
+  const [analyzeSymbol, setAnalyzeSymbol] = useState("");
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analyzeMsg, setAnalyzeMsg] = useState("");
 
   useEffect(() => {
     const tg = (window as any).Telegram?.WebApp;
@@ -91,6 +103,37 @@ export default function Dashboard() {
       fetchData(); // refresh list
     } catch (error) {
       console.error("Error rejecting signal:", error);
+    }
+  };
+
+  const handleManualScan = async () => {
+    setScanTriggering(true);
+    setScanMsg("");
+    try {
+      await supabase.from("dashboard_commands").insert({ type: "manual_scan" });
+      setScanMsg("Tetiklendi. Sonuçlar Live AI Stream'de görünecek.");
+    } catch (error) {
+      console.error("Error triggering manual scan:", error);
+      setScanMsg("Tetikleme hatası.");
+    } finally {
+      setScanTriggering(false);
+    }
+  };
+
+  const handleAnalyzeSymbol = async () => {
+    const symbol = analyzeSymbol.trim().toUpperCase().replace(/^\$/, "");
+    if (!symbol) return;
+    setAnalyzing(true);
+    setAnalyzeMsg("");
+    try {
+      await supabase.from("dashboard_commands").insert({ type: "analyze_symbol", symbol });
+      setAnalyzeMsg(`${symbol} analiz ediliyor — sonuç Live AI Stream'de görünecek.`);
+      setAnalyzeSymbol("");
+    } catch (error) {
+      console.error("Error requesting symbol analysis:", error);
+      setAnalyzeMsg("Analiz isteği hatası.");
+    } finally {
+      setAnalyzing(false);
     }
   };
 
@@ -290,7 +333,49 @@ export default function Dashboard() {
 
           {/* RIGHT COLUMN: AGENT LOGS & WALLETS */}
           <div className="flex flex-col gap-8">
-            
+
+            {/* MANUAL CONTROLS: scan trigger + on-demand symbol analysis */}
+            <div className="bg-[#1a1d2d] border border-slate-800 rounded-xl p-6">
+              <div className="flex items-center gap-2 mb-4">
+                <Search className="text-blue-400" size={24}/>
+                <h2 className="text-xl font-bold text-white">Manuel Kontroller</h2>
+              </div>
+              <div className="space-y-4">
+                <div>
+                  <button
+                    onClick={handleManualScan}
+                    disabled={scanTriggering}
+                    className="flex items-center gap-2 px-4 py-2 bg-blue-500 hover:bg-blue-600 disabled:opacity-50 text-white rounded-lg font-bold transition"
+                  >
+                    <RefreshCw size={18} className={scanTriggering ? "animate-spin" : ""} />
+                    {scanTriggering ? "Tetikleniyor..." : "Manuel Tarama Başlat"}
+                  </button>
+                  {scanMsg && <p className="text-xs text-slate-400 mt-2">{scanMsg}</p>}
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">Sembol analiz et (örn. BTC, ETHUSDT)</label>
+                  <div className="flex gap-2">
+                    <input
+                      value={analyzeSymbol}
+                      onChange={(e) => setAnalyzeSymbol(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") handleAnalyzeSymbol(); }}
+                      placeholder="BTC"
+                      className="flex-1 bg-[#0f111a] border border-slate-800 rounded-lg px-3 py-2 text-slate-200 text-sm focus:outline-none focus:border-blue-500"
+                    />
+                    <button
+                      onClick={handleAnalyzeSymbol}
+                      disabled={analyzing || !analyzeSymbol.trim()}
+                      className="flex items-center gap-2 px-4 py-2 bg-blue-500 hover:bg-blue-600 disabled:opacity-50 text-white rounded-lg font-bold transition shrink-0"
+                    >
+                      <Search size={16} />
+                      Analiz Et
+                    </button>
+                  </div>
+                  {analyzeMsg && <p className="text-xs text-slate-400 mt-2">{analyzeMsg}</p>}
+                </div>
+              </div>
+            </div>
+
             {/* AGENT LOGS */}
             <div className="bg-[#1a1d2d] border border-slate-800 rounded-xl p-6 flex-1 max-h-[500px] flex flex-col">
               <div className="flex items-center gap-2 mb-6 shrink-0">

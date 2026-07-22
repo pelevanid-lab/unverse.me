@@ -172,3 +172,24 @@ drop policy if exists "dashboard read" on public.pending_signals;
 create policy "dashboard read" on public.pending_signals for select using (true);
 drop policy if exists "dashboard approve reject" on public.pending_signals;
 create policy "dashboard approve reject" on public.pending_signals for update using (true) with check (true);
+
+-- 11) dashboard_commands: lets the web dashboard trigger the SAME on-demand
+--     actions Telegram already has (/tara manual scan, "BTC"-style symbol
+--     analysis) without exposing Redis to the public internet. The
+--     dashboard INSERTs a row; htf_agent polls this table (same pattern as
+--     execution_engine already polls pending_signals) and marks each row
+--     PROCESSED once handled. Analysis reports are written back to
+--     agent_logs (the dashboard's existing "Live AI Stream" panel already
+--     renders that table), so no separate results UI is needed.
+create table if not exists public.dashboard_commands (
+    id          uuid primary key default gen_random_uuid(),
+    type        text not null,               -- 'manual_scan' | 'analyze_symbol'
+    symbol      text,                        -- only for analyze_symbol
+    status      text not null default 'PENDING',  -- PENDING | PROCESSED
+    created_at  timestamptz not null default now()
+);
+alter table public.dashboard_commands enable row level security;
+drop policy if exists "dashboard insert" on public.dashboard_commands;
+create policy "dashboard insert" on public.dashboard_commands for insert with check (true);
+drop policy if exists "dashboard read" on public.dashboard_commands;
+create policy "dashboard read" on public.dashboard_commands for select using (true);

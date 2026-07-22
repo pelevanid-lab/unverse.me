@@ -9,61 +9,6 @@ services:
     command: redis-server --save 60 1 --loglevel warning
     restart: always
 
-  macro_agent:
-    build: .
-    container_name: unverse_macro_agent
-    command: python macro_agent.py
-    env_file: .env
-    environment:
-      - REDIS_URL=redis://redis:6379
-    depends_on:
-      - redis
-    restart: always
-
-  narrative_agent:
-    build: .
-    container_name: unverse_narrative_agent
-    command: python narrative_agent.py
-    env_file: .env
-    environment:
-      - REDIS_URL=redis://redis:6379
-    depends_on:
-      - redis
-    restart: always
-
-  level_agent:
-    build: .
-    container_name: unverse_level_agent
-    command: python level_agent.py
-    env_file: .env
-    environment:
-      - REDIS_URL=redis://redis:6379
-    depends_on:
-      - redis
-    restart: always
-
-  data_streamer:
-    build: .
-    container_name: unverse_data_streamer
-    command: python data_streamer.py
-    env_file: .env
-    environment:
-      - REDIS_URL=redis://redis:6379
-    depends_on:
-      - redis
-    restart: always
-
-  alpha_generator:
-    build: .
-    container_name: unverse_alpha_generator
-    command: python alpha_generator.py
-    env_file: .env
-    environment:
-      - REDIS_URL=redis://redis:6379
-    depends_on:
-      - redis
-    restart: always
-
   htf_agent:
     build: .
     container_name: unverse_htf_agent
@@ -79,17 +24,6 @@ services:
     build: .
     container_name: unverse_learning_agent
     command: python learning_agent.py
-    env_file: .env
-    environment:
-      - REDIS_URL=redis://redis:6379
-    depends_on:
-      - redis
-    restart: always
-
-  agent_orchestrator:
-    build: .
-    container_name: unverse_agent_orchestrator
-    command: python agent_orchestrator.py
     env_file: .env
     environment:
       - REDIS_URL=redis://redis:6379

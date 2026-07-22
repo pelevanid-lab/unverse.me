@@ -634,6 +634,7 @@ class HTFAgent:
         try:
             await asyncio.gather(
                 self.command_listener(),
+                self.poll_dashboard_commands(),
                 self.cycle_loop(),
             )
         finally:
@@ -693,6 +694,42 @@ class HTFAgent:
                 logger.error(f"Command listener error: {e}")
             await asyncio.sleep(0.1)
 
+    async def poll_dashboard_commands(self):
+        """Same two on-demand commands as command_listener, but sourced from
+        the web dashboard via Supabase instead of Telegram via Redis (Redis
+        isn't reachable from the dashboard's Vercel-hosted serverless
+        functions without exposing it to the public internet, which the
+        unauthenticated instance in docker-compose should never be)."""
+        if not config.supabase:
+            return
+        logger.info("Polling dashboard_commands (web dashboard manual scan / analyze)...")
+        while True:
+            try:
+                def _fetch():
+                    return config.supabase.table("dashboard_commands").select("*") \
+                        .eq("status", "PENDING").order("created_at").execute()
+                res = await asyncio.to_thread(_fetch)
+                for cmd in (res.data or []):
+                    cmd_id = cmd["id"]
+
+                    def _mark_processed(_id=cmd_id):
+                        config.supabase.table("dashboard_commands") \
+                            .update({"status": "PROCESSED"}).eq("id", _id).execute()
+                    await asyncio.to_thread(_mark_processed)
+
+                    if cmd.get("type") == "manual_scan":
+                        logger.info("Manual scan requested via dashboard.")
+                        self.manual_trigger_event.set()
+                    elif cmd.get("type") == "analyze_symbol":
+                        symbol = str(cmd.get("symbol", "")).strip().upper()
+                        if symbol:
+                            asyncio.create_task(self.analyze_symbol_on_demand(symbol))
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Dashboard command poll error: {e}")
+            await asyncio.sleep(3.0)
+
     async def analyze_symbol_on_demand(self, symbol: str):
         """Full evaluation for ONE named symbol, right now — regardless of
         whether it's in the current discovered universe. Reports back on
@@ -703,8 +740,12 @@ class HTFAgent:
         if not symbol.endswith("USDT"):
             symbol += "USDT"
 
-        def _report(text: str):
-            return self.redis_client.publish("telegram:analysis", orjson.dumps({
+        async def _report(text: str):
+            # Telegram (for the /tara-style on-demand flow) AND agent_logs,
+            # so the SAME report shows up in the dashboard's "Live AI Stream"
+            # panel whether the request came from Telegram or the dashboard.
+            config.send_log_to_dashboard("HTFAgent", "ANALYSIS", text)
+            await self.redis_client.publish("telegram:analysis", orjson.dumps({
                 "symbol": symbol, "report": text,
             }))
 
