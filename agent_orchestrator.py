@@ -56,6 +56,8 @@ class AgentOrchestrator:
                 "sweep_low": False, "sweep_high": False,
                 # indicator layers
                 "ema_fast": 0.0, "ema_slow": 0.0, "rsi": 50.0, "atr": 0.0,
+                # liquidity/squeeze awareness
+                "vol_1m": 0.0, "oi_surge_15m": 0.0,
             }
             self.last_trigger[sym_upper] = 0.0
 
@@ -99,6 +101,7 @@ class AgentOrchestrator:
                 self._ensure_symbol(symbol)
                 self.state[symbol]["cvd_1m"] = float(data.get("cvd_1m", 0.0))
                 self.state[symbol]["cvd_5m"] = float(data.get("cvd_5m", 0.0))
+                self.state[symbol]["vol_1m"] = float(data.get("vol_1m", 0.0))
 
             elif channel.startswith("features:imbalance:"):
                 symbol = parts[-1]
@@ -110,7 +113,8 @@ class AgentOrchestrator:
                 self._ensure_symbol(symbol)
                 st = self.state[symbol]
                 for k in ("last_price", "swing_high", "swing_low", "recent_min",
-                          "recent_max", "range_1m", "ema_fast", "ema_slow", "rsi", "atr"):
+                          "recent_max", "range_1m", "ema_fast", "ema_slow", "rsi", "atr",
+                          "oi_surge_15m"):
                     if k in data:
                         st[k] = float(data[k])
                 st["sweep_low"] = bool(data.get("sweep_low", False))
@@ -246,6 +250,8 @@ class AgentOrchestrator:
                     "atr": current_state.get("atr"),
                     "sector_bonus": current_state.get("sector_bonus"),
                     "structure_bonus": current_state.get("structure_bonus"),
+                    "vol_1m": current_state.get("vol_1m"),
+                    "oi_surge_15m": current_state.get("oi_surge_15m"),
                     "htf_zone": htf_zone_info,
                     "layer_contributions": sig.contributions,
                     # structure-based bracket the execution engine should honour

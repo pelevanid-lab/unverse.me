@@ -33,8 +33,14 @@ class AlphaGenerator:
         # { "BTCUSDT": deque([(ts, price), ...]) }
         self.price_state: Dict[str, deque] = {s.upper(): deque() for s in config.SYMBOLS}
 
+        # State: rolling (timestamp_ms, open_interest) per symbol, for squeeze
+        # awareness — rising OI during a move means fresh (not existing)
+        # positioning, which is the fuel a reversal squeezes.
+        self.oi_state: Dict[str, deque] = {s.upper(): deque() for s in config.SYMBOLS}
+
         self.window_1m = 60 * 1000  # ms
         self.window_5m = 5 * 60 * 1000  # ms
+        self.window_oi = 15 * 60 * 1000  # ms — matches macro_agent's OI surge window
 
         # Liquidity-level windows (ms)
         self.swing_lookback = int(config.SWING_LOOKBACK_SEC * 1000)
@@ -46,7 +52,9 @@ class AlphaGenerator:
         logger.info(f"Connecting to Redis at {config.REDIS_URL}")
         self.redis_client = redis.from_url(config.REDIS_URL, decode_responses=False)
         self.pubsub = self.redis_client.pubsub()
-        await self.pubsub.psubscribe("market:trades:*", "market:depth:*", "control:dynamic_symbols")
+        await self.pubsub.psubscribe(
+            "market:trades:*", "market:depth:*", "market:oi:*", "control:dynamic_symbols"
+        )
         logger.info("Subscribed to market data + dynamic-symbol channels.")
 
     def _ensure_symbol(self, sym_upper: str):
@@ -55,6 +63,7 @@ class AlphaGenerator:
             self.cvd_state[sym_upper] = deque()
             self.ob_state[sym_upper] = 0.5
             self.price_state[sym_upper] = deque()
+            self.oi_state[sym_upper] = deque()
             logger.info(f"Now tracking dynamic symbol: {sym_upper}")
 
     async def cleanup(self):
@@ -109,6 +118,18 @@ class AlphaGenerator:
         except (KeyError, ValueError, TypeError) as e:
             logger.error(f"Error processing depth data for {symbol}: {e}")
 
+    def _process_oi(self, symbol: str, data: dict):
+        """Process a raw Binance openInterest snapshot (published as-is by
+        data_streamer's REST poller): {"openInterest": "...", "symbol": "...",
+        "time": ms}. Tracked in a rolling window for squeeze-fuel detection."""
+        try:
+            oi = float(data['openInterest'])
+            ts = int(data.get('time', 0)) or int(time.time() * 1000)
+            if symbol in self.oi_state:
+                self.oi_state[symbol].append((ts, oi))
+        except (KeyError, ValueError, TypeError) as e:
+            logger.error(f"Error processing OI data for {symbol}: {e}")
+
     async def listen_to_market_data(self):
         """Listen to incoming Redis messages and process them."""
         while True:
@@ -127,6 +148,10 @@ class AlphaGenerator:
                         symbol = channel.split(":")[-1]
                         self._process_depth(symbol, data)
 
+                    elif channel.startswith("market:oi:"):
+                        symbol = channel.split(":")[-1]
+                        self._process_oi(symbol, data)
+
                     elif channel == "control:dynamic_symbols":
                         # Macro agent discovered new satellite coins -> track them.
                         for s in data:
@@ -139,28 +164,60 @@ class AlphaGenerator:
                 logger.error(f"Error reading message from Redis: {e}")
                 await asyncio.sleep(1)
 
-    def _calculate_cvd(self, symbol: str, current_ts: int) -> tuple[float, float]:
-        """Calculate 1m and 5m CVD and clean up old data."""
+    def _calculate_cvd(self, symbol: str, current_ts: int) -> tuple[float, float, float]:
+        """Calculate 1m and 5m CVD plus raw 1m traded volume, and clean up old data.
+
+        vol_1m (buy_vol + sell_vol, not the delta) is a genuine liquidity
+        measure — unlike ATR (price range), it reflects real participation.
+        A clean-looking sweep on very low volume is exactly the "everyone
+        chases every candle, low volume, don't trust it" trap; vol_1m lets
+        the confluence engine filter that out directly instead of relying on
+        price-range alone.
+        """
         if symbol not in self.cvd_state:
-            return 0.0, 0.0
-            
+            return 0.0, 0.0, 0.0
+
         dq = self.cvd_state[symbol]
-        
+
         # Remove elements older than 5m
         while dq and current_ts - dq[0][0] > self.window_5m:
             dq.popleft()
-            
+
         cvd_1m = 0.0
         cvd_5m = 0.0
-        
+        vol_1m = 0.0
+
         # Calculate from right to left (newest to oldest)
         for ts, buy_vol, sell_vol in reversed(dq):
             delta = buy_vol - sell_vol
             cvd_5m += delta
             if current_ts - ts <= self.window_1m:
                 cvd_1m += delta
-                
-        return cvd_1m, cvd_5m
+                vol_1m += buy_vol + sell_vol
+
+        return cvd_1m, cvd_5m, vol_1m
+
+    def _calculate_oi_surge(self, symbol: str, current_ts: int) -> float:
+        """% change in Open Interest over the last ~15 minutes.
+
+        Positive = fresh positioning has been building (squeeze fuel for
+        whichever direction eventually reverses). Cleans up old entries.
+        """
+        if symbol not in self.oi_state:
+            return 0.0
+
+        dq = self.oi_state[symbol]
+        while dq and current_ts - dq[0][0] > self.window_oi:
+            dq.popleft()
+
+        if len(dq) < 2:
+            return 0.0
+
+        old_oi = dq[0][1]
+        new_oi = dq[-1][1]
+        if old_oi <= 0:
+            return 0.0
+        return (new_oi - old_oi) / old_oi * 100.0
 
     def _compute_levels(self, symbol: str, current_ts: int) -> dict:
         """Track liquidity levels and detect stop-hunt sweeps.
@@ -238,12 +295,13 @@ class AlphaGenerator:
                 # Loop over ALL tracked symbols (core + dynamic), not just config.
                 for sym_upper in list(self.cvd_state.keys()):
 
-                    # 1. Calculate and publish CVD
-                    cvd_1m, cvd_5m = self._calculate_cvd(sym_upper, current_ts)
+                    # 1. Calculate and publish CVD (+ raw 1m volume)
+                    cvd_1m, cvd_5m, vol_1m = self._calculate_cvd(sym_upper, current_ts)
                     cvd_payload = {
                         "symbol": sym_upper,
                         "cvd_1m": round(cvd_1m, 4),
                         "cvd_5m": round(cvd_5m, 4),
+                        "vol_1m": round(vol_1m, 6),
                         "timestamp": current_ts
                     }
                     await self.redis_client.publish(
@@ -267,6 +325,9 @@ class AlphaGenerator:
                     levels = self._compute_levels(sym_upper, current_ts)
                     if levels:
                         levels["timestamp"] = current_ts
+                        levels["oi_surge_15m"] = round(
+                            self._calculate_oi_surge(sym_upper, current_ts), 3
+                        )
                         await self.redis_client.publish(
                             f"features:levels:{sym_upper}",
                             orjson.dumps(levels)

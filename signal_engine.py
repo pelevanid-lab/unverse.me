@@ -237,6 +237,20 @@ MIN_CONFIRMATIONS = 2          # non-structure layers that must agree
 VOL_FLOOR_PCT = 0.0006         # ATR/price below this = dead market, skip
 CONFLUENCE_THRESHOLD = 0.45    # min |score| to fire
 
+# Genuine liquidity floor (notional, in quote currency e.g. USDT) over the
+# last 1 minute. ATR only measures price RANGE, not real participation — a
+# clean-looking wick on thin volume is exactly the "everyone chases every
+# candle" trap flagged as unreliable. Below this, skip regardless of how the
+# setup otherwise looks.
+MIN_NOTIONAL_VOL_1M = 20_000.0
+
+# Squeeze/OI awareness: rising Open Interest into a move means fresh
+# positioning (not existing longs/shorts) is building — exactly the fuel a
+# reversal squeezes. Symmetric: it boosts whichever direction the sweep
+# already implies, since OI itself is directionless (it's a magnitude).
+OI_SURGE_NORM_PCT = 5.0        # % 15m OI surge that earns the FULL bonus
+SQUEEZE_BONUS_MAX = 0.20
+
 
 def _clip(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
     return max(lo, min(x, hi))
@@ -276,6 +290,14 @@ def evaluate_confluence(
     if vol_ratio < VOL_FLOOR_PCT:
         return Signal("WAIT", 0.0, 0.0,
                       reasoning=f"Volatility too low (ATR/price {vol_ratio:.4f}); skipping.")
+
+    # --- Liquidity gate: genuine traded volume, not just price range ---
+    vol_1m = float(state.get("vol_1m", 0.0) or 0.0)
+    notional_vol_1m = vol_1m * last
+    if notional_vol_1m < MIN_NOTIONAL_VOL_1M:
+        return Signal("WAIT", 0.0, 0.0,
+                      reasoning=(f"1m volume too thin (${notional_vol_1m:,.0f} < "
+                                 f"${MIN_NOTIONAL_VOL_1M:,.0f}); low-volume setups aren't trustworthy."))
 
     # --- Layer 3: order flow ---
     cvd_1m = float(state.get("cvd_1m", 0.0) or 0.0)
@@ -320,11 +342,19 @@ def evaluate_confluence(
     # support). Computed upstream (level_engine + agent_orchestrator) and
     # passed in already direction-checked, so it's simply additive here.
     structure_bonus = float(state.get("structure_bonus", 0.0) or 0.0)
-    score = raw + want * sector_bonus + want * structure_bonus
+
+    # Squeeze/OI bonus: rising OI over the last 15m = fresh positioning built
+    # up, i.e. fuel for a squeeze in whichever direction the sweep implies.
+    # Falling/flat OI (de-risking) earns no bonus — only genuine buildup does.
+    oi_surge_15m = float(state.get("oi_surge_15m", 0.0) or 0.0)
+    squeeze_bonus = _clip(oi_surge_15m / OI_SURGE_NORM_PCT, 0.0, 1.0) * SQUEEZE_BONUS_MAX
+
+    score = raw + want * sector_bonus + want * structure_bonus + want * squeeze_bonus
 
     contributions = {k: round(w.get(k, 0.0) * layers[k] / total_w, 4) for k in layers}
     contributions["sector_bonus"] = round(want * sector_bonus, 4)
     contributions["structure_bonus"] = round(want * structure_bonus, 4)
+    contributions["squeeze_bonus"] = round(want * squeeze_bonus, 4)
 
     passes = (n_confirm >= MIN_CONFIRMATIONS) and (abs(score) >= CONFLUENCE_THRESHOLD) \
         and (score * want > 0)
@@ -356,8 +386,8 @@ def evaluate_confluence(
     confidence = min(abs(score), 1.0)
     reason = (f"{direction} confluence {score:+.2f} | confirms: {'+'.join(confirmers) or 'none'} "
               f"| flow {orderflow:+.2f} trend {trend:+.2f} rsi {rsi_val:.0f} "
-              f"sector {sector_bonus:.2f} structure {structure_bonus:.2f} "
-              f"| SL {sl:.6g} TP {tp:.6g} @ {tp_r_multiple}R.")
+              f"sector {sector_bonus:.2f} structure {structure_bonus:.2f} squeeze {squeeze_bonus:.2f} "
+              f"| vol1m ${notional_vol_1m:,.0f} | SL {sl:.6g} TP {tp:.6g} @ {tp_r_multiple}R.")
     return Signal(direction, confidence, score, contributions=contributions,
                   reasoning=reason, sl_price=sl, tp_price=tp)
 
