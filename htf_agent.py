@@ -857,8 +857,22 @@ class HTFAgent:
             await _report("\n".join(lines))
 
             if sig.action in ("LONG", "SHORT") and sig.confidence >= config.HTF_MIN_CONFIDENCE:
-                logger.info(f"[{symbol}] On-demand analysis is ACTIONABLE; dispatching for approval.")
-                await self.dispatch_signal(symbol, sig)
+                # The report above always goes out, but dispatch-for-approval
+                # respects the same per-symbol cooldown as the scanner —
+                # otherwise every "XMR" text or scan restart re-sends the
+                # same still-valid daily signal for approval yet again.
+                now_ms = time.time() * 1000
+                cooldown_ms = config.HTF_SIGNAL_COOLDOWN_HOURS * 3600 * 1000
+                if now_ms - self.last_signal_ts.get(symbol, 0) < cooldown_ms:
+                    logger.info(f"[{symbol}] On-demand {sig.action} actionable but "
+                                f"within dispatch cooldown; report only.")
+                    await _report(f"ℹ️ {symbol} sinyali işlem yapılabilir görünüyor ama son "
+                                  f"{config.HTF_SIGNAL_COOLDOWN_HOURS:.0f} saat içinde zaten "
+                                  "onaya gönderilmişti — tekrar gönderilmedi.")
+                else:
+                    self.last_signal_ts[symbol] = now_ms
+                    logger.info(f"[{symbol}] On-demand analysis is ACTIONABLE; dispatching for approval.")
+                    await self.dispatch_signal(symbol, sig)
         except Exception as e:
             logger.error(f"[{symbol}] On-demand analysis failed: {e}")
             await _report(f"{symbol} analiz hatası: {e}")
