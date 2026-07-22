@@ -108,28 +108,22 @@ create table if not exists public.narrative_trends (
     updated_at  timestamptz not null default now()
 );
 
--- 8) bot_config: UI-editable runtime settings (watchlist, strategy, params)
---    Key-value so you can add knobs without migrations. Agents read this.
-create table if not exists public.bot_config (
-    key         text primary key,
-    value       jsonb,
-    updated_at  timestamptz not null default now()
-);
 
--- Seed the default config rows (only if absent).
-insert into public.bot_config (key, value) values
-    ('symbols',   '["btcusdt","ondousdt","dogeusdt","crvusdt","roseusdt"]'::jsonb),
-    ('strategy',  '"confluence"'::jsonb),
-    ('risk_per_trade_pct', '0.015'::jsonb),
-    ('tp_r_multiple',      '2.0'::jsonb),
-    ('leverage',           '10'::jsonb)
-on conflict (key) do nothing;
-
--- 9) htf_levels: the HTF (multi-month) support/resistance zones level_agent
+-- 8) htf_levels: the HTF (multi-month) support/resistance zones level_agent
 --    publishes per symbol, and the polarity role (support/resistance) each
 --    currently implies. Dashboard-visible mirror of what's cached in Redis.
 create table if not exists public.htf_levels (
     symbol      text primary key,
     zones       jsonb,      -- [{price_low, price_high, touches, last_touch_ts, role}, ...]
+    updated_at  timestamptz not null default now()
+);
+
+-- 9) learning_state: the learning agent's current calibration derived from
+--    the trade journal (per-trigger-type stats, bounded confidence deltas,
+--    disabled trigger types, trailing multiplier). Single-row upsert; the
+--    live copy htf_agent actually reads is the Redis key "learn:adjustments".
+create table if not exists public.learning_state (
+    id          integer primary key,
+    state       jsonb,
     updated_at  timestamptz not null default now()
 );

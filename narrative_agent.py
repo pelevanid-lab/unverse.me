@@ -186,7 +186,7 @@ class NarrativeAgent:
             logger.info(f"Narrative view [{'LIVE' if self.grounded else 'STALE'}]: {top}")
             logger.info(f"Bonus map: {bonus_map}")
 
-            # Mirror to the dashboard (and it's editable there — see bot_config).
+            # Mirror to the dashboard log feed.
             config.send_log_to_dashboard(
                 "NarrativeAgent",
                 "GROUNDED" if self.grounded else "UNGROUNDED",

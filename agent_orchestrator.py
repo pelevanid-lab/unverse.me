@@ -260,38 +260,41 @@ class AgentOrchestrator:
                 }
 
                 def _insert_pending_signal():
-                    try:
-                        res = config.supabase.table("pending_signals").insert({
-                            "symbol": symbol,
-                            "action": sig.action,
-                            "confidence": sig.confidence,
-                            "reasoning": sig.reasoning,
-                            "score": sig.score,
-                            "features": features,
-                            "sl_price": sig.sl_price,
-                            "tp_price": sig.tp_price,
-                            "status": "PENDING"
-                        }).execute()
-                        logger.info(f"[{symbol}] Dispatched PENDING signal to Dashboard for user approval.")
-                        
-                        signal_id = res.data[0]['id'] if res.data else str(int(time.time() * 1000))
-                        
-                        # Also notify Telegram Agent
-                        if self.redis_client:
-                            asyncio.run_coroutine_threadsafe(
-                                self.redis_client.publish("telegram:notify", orjson.dumps({
-                                    "signal_id": signal_id,
-                                    "symbol": symbol,
-                                    "action": sig.action,
-                                    "confidence": sig.confidence,
-                                    "reasoning": sig.reasoning
-                                })),
-                                asyncio.get_running_loop()
-                            )
-                    except Exception as e:
-                        logger.error(f"[{symbol}] Failed to insert pending signal to Supabase: {e}")
+                    """Runs in a worker thread; returns the new signal id."""
+                    res = config.supabase.table("pending_signals").insert({
+                        "symbol": symbol,
+                        "action": sig.action,
+                        "confidence": sig.confidence,
+                        "reasoning": sig.reasoning,
+                        "score": sig.score,
+                        "features": features,
+                        "sl_price": sig.sl_price,
+                        "tp_price": sig.tp_price,
+                        "status": "PENDING"
+                    }).execute()
+                    return res.data[0]['id'] if res.data else str(int(time.time() * 1000))
 
-                asyncio.create_task(asyncio.to_thread(_insert_pending_signal))
+                async def _dispatch():
+                    # BUG FIX: the old code called asyncio.get_running_loop()
+                    # INSIDE the worker thread (no loop there), which raised and
+                    # silently killed every Telegram notification. Insert in a
+                    # thread, then publish from THIS event loop.
+                    try:
+                        signal_id = await asyncio.to_thread(_insert_pending_signal)
+                        logger.info(f"[{symbol}] Dispatched PENDING signal (id={signal_id}).")
+                        if self.redis_client:
+                            await self.redis_client.publish("telegram:notify", orjson.dumps({
+                                "signal_id": signal_id,
+                                "symbol": symbol,
+                                "action": sig.action,
+                                "confidence": sig.confidence,
+                                "reasoning": sig.reasoning
+                            }))
+                            logger.info(f"[{symbol}] Telegram notification published.")
+                    except Exception as e:
+                        logger.error(f"[{symbol}] Failed to dispatch pending signal: {e}")
+
+                asyncio.create_task(_dispatch())
 
     async def listen_to_channels(self):
         """Listen to incoming Redis messages and update state."""
@@ -346,6 +349,15 @@ class AgentOrchestrator:
             await asyncio.sleep(1.0)
 
     async def run(self):
+        # In HTF mode the decision layer is htf_agent (4h closed-candle
+        # breakouts). This 1-minute/15-minute pipeline stays completely
+        # silent so it can never emit the old scalper signals alongside.
+        if config.STRATEGY == "htf_breakout":
+            logger.info("STRATEGY='htf_breakout': orchestrator idle; "
+                        "signals come from htf_agent.")
+            while True:
+                await asyncio.sleep(3600)
+
         await self.initialize()
         try:
             await asyncio.gather(

@@ -313,13 +313,30 @@ class ExecutionEngine:
             ticker = await self.exchange.fetch_ticker(ccxt_symbol)
             current_price = float(ticker['last'])
 
-            # 3. Risk Math
-            risk_amount = free_margin * config.RISK_PER_TRADE_PCT
+            # 3. Risk Math — confidence-scaled ("low conviction, small size").
+            # RISK_PER_TRADE_PCT is the MAXIMUM; a signal at the confidence
+            # floor (0.55) risks half of it, scaling linearly to full size at
+            # 0.85+. Deterministic and journalled, so learn.py can verify the
+            # scaling actually helps.
+            confidence = float((signal_meta.get("signal") or {}).get("confidence") or 0.0)
+            if confidence > 0:
+                risk_mult = max(0.5, min(1.0, 0.5 + 0.5 * (confidence - 0.55) / 0.30))
+            else:
+                risk_mult = 1.0   # legacy/manual signals without a confidence
+            risk_amount = free_margin * config.RISK_PER_TRADE_PCT * risk_mult
+            logger.info(f"[{symbol}] Risk sizing: conf {confidence:.2f} -> "
+                        f"{risk_mult:.2f}x of {config.RISK_PER_TRADE_PCT:.0%} = "
+                        f"${risk_amount:.2f}")
 
             # Prefer the structure-based bracket from the strategy (stop placed
             # beyond the swept wick). Fall back to fixed-percent only if absent.
-            sig_sl = signal_meta.get("features", {}).get("sl_price") if signal_meta.get("features") else None
-            sig_tp = signal_meta.get("features", {}).get("tp_price") if signal_meta.get("features") else None
+            features = signal_meta.get("features") or {}
+            sig_sl = features.get("sl_price")
+            sig_tp = features.get("tp_price")
+            # HTF trend trades carry trail_mode="structure": NO fixed TP at all;
+            # the exit is the trailing stop ratcheted by htf_agent on each 4h
+            # close (via the manage:stop channel).
+            trail_managed = features.get("trail_mode") == "structure"
 
             if action == "LONG":
                 side = 'buy'
@@ -385,7 +402,14 @@ class ExecutionEngine:
             # Take-profit / runner management.
             partial_qty = 0.0
             runner_qty = 0.0
-            if config.USE_TRAILING:
+            if trail_managed:
+                # HTF trend trade: stop-loss only. No TP order caps the winner;
+                # htf_agent ratchets the stop upward/downward on every 4h close
+                # until the trend breaks. This is the "stay in until the move
+                # is over" exit.
+                logger.info(f"[{symbol}] Trail-managed position: SL only at "
+                            f"{formatted_sl_price}, no fixed TP (trend exit).")
+            elif config.USE_TRAILING:
                 # TP1 banks part of the winner; the rest trails the trend.
                 raw_partial = qty * config.PARTIAL_TP_PCT
                 partial_qty = float(self.exchange.amount_to_precision(ccxt_symbol, raw_partial))
@@ -399,9 +423,12 @@ class ExecutionEngine:
                 formatted_tp1 = float(self.exchange.price_to_precision(ccxt_symbol, tp1_price))
 
             # Only use the managed exit if BOTH slices survive precision/min-size.
-            use_managed = config.USE_TRAILING and partial_qty > 0 and runner_qty > 0
+            use_managed = (not trail_managed) and config.USE_TRAILING \
+                and partial_qty > 0 and runner_qty > 0
 
-            if use_managed:
+            if trail_managed:
+                pass  # no TP orders of any kind; exit is the ratcheting stop
+            elif use_managed:
                 # Partial TP1 (reduceOnly, banks profit at the near target)
                 tp_order = await self.exchange.create_order(
                     symbol=ccxt_symbol,
@@ -461,6 +488,9 @@ class ExecutionEngine:
                 "entry_price": actual_entry,
                 "side": action,
                 "quantity": qty,
+                "sl_price": formatted_sl_price,
+                "sl_order_id": sl_order.get('id'),
+                "trail_managed": trail_managed,
             }
             trade_journal.record_entry(
                 trade_id=trade_id,
@@ -511,6 +541,158 @@ class ExecutionEngine:
         except Exception as e:
             logger.error(f"[{symbol}] Execution Pipeline Failed: {e}")
 
+    async def apply_stop_update(self, symbol: str, side: str, new_sl: float):
+        """Move the exchange stop order for an open position (trailing ratchet).
+
+        Only ever tightens: a long's stop moves UP, a short's moves DOWN. The
+        old STOP_MARKET is cancelled and a fresh closePosition stop is placed
+        at the new level.
+        """
+        if symbol not in self.active_positions:
+            logger.info(f"[{symbol}] Stop update ignored: no active position.")
+            return
+        ctx = self.position_context.get(symbol, {})
+        current_sl = ctx.get("sl_price")
+        if current_sl is not None:
+            improves = (new_sl > current_sl) if side == "LONG" else (new_sl < current_sl)
+            if not improves:
+                logger.info(f"[{symbol}] Stop update {new_sl} does not improve on "
+                            f"{current_sl}; ignored (ratchet only).")
+                return
+
+        ccxt_symbol = self._resolve_ccxt_symbol(symbol)
+        if not ccxt_symbol:
+            logger.error(f"[{symbol}] Cannot resolve ccxt symbol for stop update.")
+            return
+        try:
+            formatted_sl = float(self.exchange.price_to_precision(ccxt_symbol, new_sl))
+            sl_side = 'sell' if side == "LONG" else 'buy'
+
+            # Cancel the existing stop first (by id when known, else all —
+            # trail-managed positions only ever hold the one stop order).
+            old_id = ctx.get("sl_order_id")
+            if old_id:
+                try:
+                    await self.exchange.cancel_order(old_id, ccxt_symbol)
+                except Exception as e:
+                    logger.warning(f"[{symbol}] Could not cancel old SL {old_id}: {e}")
+            else:
+                try:
+                    await self.exchange.cancel_all_orders(ccxt_symbol)
+                except Exception as e:
+                    logger.warning(f"[{symbol}] cancel_all before stop move failed: {e}")
+
+            sl_order = await self.exchange.create_order(
+                symbol=ccxt_symbol,
+                type='STOP_MARKET',
+                side=sl_side,
+                amount=ctx.get("quantity") or 0,
+                params={'stopPrice': formatted_sl, 'closePosition': True}
+            )
+            ctx["sl_price"] = formatted_sl
+            ctx["sl_order_id"] = sl_order.get('id')
+            self.position_context[symbol] = ctx
+            logger.info(f"[{symbol}] Trailing stop moved to {formatted_sl}.")
+            config.send_log_to_dashboard(
+                "ExecutionEngine", "STOP_MOVED",
+                f"[{symbol}] {side} stop trailed to {formatted_sl}."
+            )
+        except Exception as e:
+            logger.error(f"[{symbol}] Failed to move stop to {new_sl}: {e}")
+
+    async def listen_stop_updates(self):
+        """Subscribe to manage:stop and apply trailing-stop ratchets."""
+        pubsub = self.redis_client.pubsub()
+        await pubsub.subscribe("manage:stop")
+        logger.info("Listening for trailing-stop updates on manage:stop...")
+        while True:
+            try:
+                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if message and message['type'] == 'message':
+                    data = orjson.loads(message['data'])
+                    await self.apply_stop_update(
+                        str(data['symbol']), str(data.get('side', 'LONG')),
+                        float(data['new_sl'])
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in stop-update listener: {e}")
+            await asyncio.sleep(0.2)
+
+    async def apply_derisk(self, symbol: str, side: str, fraction: float):
+        """Partially close a position ahead of a major HTF zone (Melih's
+        "büyük dirence yaklaşırken pozisyon hafiflet" pattern). This only
+        ever REDUCES exposure — never opens or reverses anything — so like
+        the trailing-stop ratchet it runs autonomously, no approval needed.
+
+        Reads the LIVE position size from the exchange rather than trusting
+        locally-tracked quantity, since a prior de-risk (or partial fill)
+        may already have shrunk it.
+        """
+        if symbol not in self.active_positions:
+            logger.info(f"[{symbol}] De-risk ignored: no active position.")
+            return
+        ccxt_symbol = self._resolve_ccxt_symbol(symbol)
+        if not ccxt_symbol:
+            logger.error(f"[{symbol}] Cannot resolve ccxt symbol for de-risk.")
+            return
+        try:
+            positions = await self.exchange.fetch_positions([ccxt_symbol])
+            live_qty = 0.0
+            for pos in positions:
+                if self._normalize_symbol(pos['symbol']) == symbol:
+                    live_qty = abs(float(pos.get('contracts', 0) or 0))
+                    break
+            if live_qty <= 0:
+                logger.info(f"[{symbol}] De-risk skipped: no live position quantity found.")
+                return
+
+            close_side = 'sell' if side == "LONG" else 'buy'
+            qty = float(self.exchange.amount_to_precision(ccxt_symbol, live_qty * fraction))
+            if qty <= 0:
+                logger.info(f"[{symbol}] De-risk quantity rounds to 0; skipping.")
+                return
+
+            await self.exchange.create_order(
+                symbol=ccxt_symbol, type='market', side=close_side,
+                amount=qty, params={'reduceOnly': True}
+            )
+            logger.info(f"[{symbol}] De-risked {qty} ({fraction:.0%} of {live_qty}) at market. "
+                        f"closePosition=True stop/trailing orders auto-adjust to the new size.")
+
+            ctx = self.position_context.get(symbol)
+            if ctx:
+                ctx["quantity"] = max(live_qty - qty, 0.0)
+
+            config.send_log_to_dashboard(
+                "ExecutionEngine", "DERISK",
+                f"[{symbol}] {side} pozisyonun %{fraction*100:.0f}'i majör bölge öncesi "
+                f"piyasa fiyatından kapatıldı ({qty} adet)."
+            )
+        except Exception as e:
+            logger.error(f"[{symbol}] Failed to de-risk: {e}")
+
+    async def listen_derisk_updates(self):
+        """Subscribe to manage:derisk and apply partial position reductions."""
+        pubsub = self.redis_client.pubsub()
+        await pubsub.subscribe("manage:derisk")
+        logger.info("Listening for de-risk triggers on manage:derisk...")
+        while True:
+            try:
+                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if message and message['type'] == 'message':
+                    data = orjson.loads(message['data'])
+                    await self.apply_derisk(
+                        str(data['symbol']), str(data.get('side', 'LONG')),
+                        float(data['fraction'])
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in de-risk listener: {e}")
+            await asyncio.sleep(0.2)
+
     async def monitor_pending_approvals(self):
         """Poll Supabase for signals that have been manually approved by the user."""
         logger.info("Starting Pending Approvals monitor loop...")
@@ -558,7 +740,11 @@ class ExecutionEngine:
     async def run(self):
         await self.initialize()
         try:
-            await self.monitor_pending_approvals()
+            await asyncio.gather(
+                self.monitor_pending_approvals(),
+                self.listen_stop_updates(),
+                self.listen_derisk_updates(),
+            )
         finally:
             await self.cleanup()
 

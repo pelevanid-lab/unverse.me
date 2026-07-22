@@ -64,6 +64,28 @@ services:
       - redis
     restart: always
 
+  htf_agent:
+    build: .
+    container_name: unverse_htf_agent
+    command: python htf_agent.py
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+    restart: always
+
+  learning_agent:
+    build: .
+    container_name: unverse_learning_agent
+    command: python learning_agent.py
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+    restart: always
+
   agent_orchestrator:
     build: .
     container_name: unverse_agent_orchestrator
