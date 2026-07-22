@@ -187,7 +187,21 @@ class HTFAgent:
                 ratio = htf_strategy.squeeze_ratio(
                     bars, config.HTF_SQUEEZE_RECENT_DAYS, config.HTF_SQUEEZE_BASELINE_DAYS
                 )
-                if ratio is not None:
+                if ratio is None:
+                    pass
+                elif (atr := htf_strategy.true_atr(bars, 14)) > 0 and bars \
+                        and atr / bars[-1].close > config.HTF_MAX_ATR_PCT:
+                    # Post-collapse flatline, not a coil: a dead coin crawling
+                    # at the bottom after a -99% dump has a microscopic recent
+                    # range vs its crash-era baseline, so squeeze_ratio reads
+                    # it as the "tightest squeeze on the market" (LABUSDT
+                    # scored 0.02 this way on 2026-07-22). The evaluation-side
+                    # ATR gate already refuses to trade these; skipping them
+                    # here too stops them wasting one of the 30 watchlist
+                    # slots that should go to genuine compressions.
+                    logger.info(f"[{binance_id}] Excluded from discovery: ATR "
+                                f"{atr / bars[-1].close:.0%} of price (post-collapse flatline).")
+                else:
                     scored.append((ratio, binance_id, ccxt_sym))
             except Exception as e:
                 logger.warning(f"[{binance_id}] Squeeze scan failed: {e}")
