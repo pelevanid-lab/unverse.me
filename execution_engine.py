@@ -17,6 +17,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ExecutionEngine")
 
+
+def _bool_str(value: bool) -> str:
+    return "true" if value else "false"
+
+
 class ExecutionEngine:
     def __init__(self):
         self.redis_client = None
@@ -149,6 +154,60 @@ class ExecutionEngine:
         for sym in self.exchange.markets:
             if sym.replace("/", "").replace(":", "").startswith(symbol):
                 return sym
+
+    # ------------------------------------------------------------------
+    # Binance's Algo Order API (conditional orders) — since 2025-12-09
+    # Binance migrated ALL conditional futures order types (STOP_MARKET,
+    # TAKE_PROFIT_MARKET, TRAILING_STOP_MARKET, ...) off the standard
+    # POST/DELETE /fapi/v1/order endpoints entirely; they now reject those
+    # types outright with error -4120 ("use the Algo Order API instead"),
+    # regardless of reduceOnly/closePosition. This is what left the
+    # XMRUSDT and LABUSDT positions with NO stop-loss on 2026-07-22 despite
+    # two different parameter combinations being tried — the endpoint
+    # itself was the problem, not the params.
+    #
+    # ccxt's unified create_order()/cancel_order() don't wrap the new
+    # /fapi/v1/algoOrder endpoint yet, so these call ccxt's generic signed
+    # request() method directly — this works regardless of whether the
+    # installed ccxt release has a pre-registered named alias for it.
+    # Docs: https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/New-Algo-Order
+    # ------------------------------------------------------------------
+    async def _create_algo_conditional(
+        self, ccxt_symbol: str, side: str, order_type: str,
+        amount: float = None, stop_price: float = None,
+        activate_price: float = None, callback_rate: float = None,
+        reduce_only: bool = True,
+    ) -> dict:
+        market = self.exchange.market(ccxt_symbol)
+        params = {
+            "algoType": "CONDITIONAL",
+            "symbol": market["id"],
+            "side": side.upper(),
+            "type": order_type,
+            "reduceOnly": _bool_str(reduce_only),
+        }
+        if amount is not None:
+            params["quantity"] = self.exchange.amount_to_precision(ccxt_symbol, amount)
+        if stop_price is not None:
+            params["stopPrice"] = self.exchange.price_to_precision(ccxt_symbol, stop_price)
+        if activate_price is not None:
+            params["activationPrice"] = self.exchange.price_to_precision(ccxt_symbol, activate_price)
+        if callback_rate is not None:
+            params["callbackRate"] = str(callback_rate)
+        return await self.exchange.request("algoOrder", "fapiPrivate", "POST", params)
+
+    async def _cancel_algo_order(self, ccxt_symbol: str, algo_id) -> dict:
+        market = self.exchange.market(ccxt_symbol)
+        return await self.exchange.request(
+            "algoOrder", "fapiPrivate", "DELETE",
+            {"symbol": market["id"], "algoId": algo_id},
+        )
+
+    async def _cancel_all_algo_orders(self, ccxt_symbol: str) -> dict:
+        market = self.exchange.market(ccxt_symbol)
+        return await self.exchange.request(
+            "algoOpenOrders", "fapiPrivate", "DELETE", {"symbol": market["id"]},
+        )
         return None
 
     async def _compute_realized_result(self, symbol: str, since_ts):
@@ -207,13 +266,20 @@ class ExecutionEngine:
 
                     # Cancel any leftover bracket orders (SL / TP1 / trailing) so
                     # a closed position never leaves dangling reduceOnly orders.
+                    # Algo (conditional) orders are a separate order book from
+                    # regular orders since Binance's Algo Order API migration,
+                    # so both cancel calls are needed.
                     ccxt_symbol = self._resolve_ccxt_symbol(closed_sym)
                     if ccxt_symbol:
                         try:
                             await self.exchange.cancel_all_orders(ccxt_symbol)
-                            logger.info(f"[{closed_sym}] Cancelled leftover bracket orders.")
                         except Exception as e:
                             logger.warning(f"[{closed_sym}] Could not cancel leftover orders: {e}")
+                        try:
+                            await self._cancel_all_algo_orders(ccxt_symbol)
+                        except Exception as e:
+                            logger.warning(f"[{closed_sym}] Could not cancel leftover algo orders: {e}")
+                        logger.info(f"[{closed_sym}] Cancelled leftover bracket orders.")
 
                     ctx = self.position_context.pop(closed_sym, {})
                     entry_ts = ctx.get("entry_ts")
@@ -393,17 +459,12 @@ class ExecutionEngine:
             # on 2026-07-22 (XMRUSDT). reduceOnly caps the fill at whatever
             # position remains open (never reverses it), so a stale qty after
             # a later partial de-risk still closes the position fully.
-            sl_order = await self.exchange.create_order(
-                symbol=ccxt_symbol,
-                type='STOP_MARKET',
-                side=sl_side,
-                amount=qty,
-                params={
-                    'stopPrice': formatted_sl_price,
-                    'reduceOnly': True,
-                }
+            sl_algo = await self._create_algo_conditional(
+                ccxt_symbol, side=sl_side, order_type='STOP_MARKET',
+                amount=qty, stop_price=formatted_sl_price, reduce_only=True,
             )
-            logger.info(f"[{symbol}] SL PLACED: {sl_order['id']} at {formatted_sl_price}")
+            sl_algo_id = sl_algo.get('algoId')
+            logger.info(f"[{symbol}] SL PLACED (algo): {sl_algo_id} at {formatted_sl_price}")
 
             # Take-profit / runner management.
             partial_qty = 0.0
@@ -436,12 +497,9 @@ class ExecutionEngine:
                 pass  # no TP orders of any kind; exit is the ratcheting stop
             elif use_managed:
                 # Partial TP1 (reduceOnly, banks profit at the near target)
-                tp_order = await self.exchange.create_order(
-                    symbol=ccxt_symbol,
-                    type='TAKE_PROFIT_MARKET',
-                    side=sl_side,
-                    amount=partial_qty,
-                    params={'stopPrice': formatted_tp1, 'reduceOnly': True}
+                await self._create_algo_conditional(
+                    ccxt_symbol, side=sl_side, order_type='TAKE_PROFIT_MARKET',
+                    amount=partial_qty, stop_price=formatted_tp1, reduce_only=True,
                 )
                 logger.info(f"[{symbol}] TP1 (partial {partial_qty}) at {formatted_tp1}")
 
@@ -449,37 +507,24 @@ class ExecutionEngine:
                 # then follows the trend by callbackRate. This is what keeps us in
                 # the trade when the coin "flies" after the first target.
                 try:
-                    trail_order = await self.exchange.create_order(
-                        symbol=ccxt_symbol,
-                        type='TRAILING_STOP_MARKET',
-                        side=sl_side,
-                        amount=runner_qty,
-                        params={
-                            'activationPrice': formatted_tp1,
-                            'callbackRate': config.TRAIL_CALLBACK_PCT,
-                            'reduceOnly': True
-                        }
+                    await self._create_algo_conditional(
+                        ccxt_symbol, side=sl_side, order_type='TRAILING_STOP_MARKET',
+                        amount=runner_qty, activate_price=formatted_tp1,
+                        callback_rate=config.TRAIL_CALLBACK_PCT, reduce_only=True,
                     )
                     logger.info(f"[{symbol}] RUNNER trailing {runner_qty} activates @ {formatted_tp1}, callback {config.TRAIL_CALLBACK_PCT}%")
                 except Exception as e:
                     # If trailing is rejected, fall back to a fixed TP for the runner.
                     logger.warning(f"[{symbol}] Trailing stop rejected ({e}); using fixed TP for runner.")
-                    await self.exchange.create_order(
-                        symbol=ccxt_symbol, type='TAKE_PROFIT_MARKET', side=sl_side,
-                        amount=runner_qty,
-                        params={'stopPrice': formatted_tp_price, 'reduceOnly': True}
+                    await self._create_algo_conditional(
+                        ccxt_symbol, side=sl_side, order_type='TAKE_PROFIT_MARKET',
+                        amount=runner_qty, stop_price=formatted_tp_price, reduce_only=True,
                     )
             else:
                 # Fallback: single full-size take-profit (original behaviour).
-                # reduceOnly + explicit qty, not closePosition=True — see the
-                # SL comment above for why (Binance -4120 on the standard
-                # order endpoint).
-                tp_order = await self.exchange.create_order(
-                    symbol=ccxt_symbol,
-                    type='TAKE_PROFIT_MARKET',
-                    side=sl_side,
-                    amount=qty,
-                    params={'stopPrice': formatted_tp_price, 'reduceOnly': True}
+                tp_order = await self._create_algo_conditional(
+                    ccxt_symbol, side=sl_side, order_type='TAKE_PROFIT_MARKET',
+                    amount=qty, stop_price=formatted_tp_price, reduce_only=True,
                 )
                 logger.info(f"[{symbol}] TP (full) at {formatted_tp_price}")
 
@@ -498,7 +543,7 @@ class ExecutionEngine:
                 "side": action,
                 "quantity": qty,
                 "sl_price": formatted_sl_price,
-                "sl_order_id": sl_order.get('id'),
+                "sl_order_id": sl_algo_id,
                 "trail_managed": trail_managed,
             }
             trade_journal.record_entry(
@@ -578,19 +623,22 @@ class ExecutionEngine:
             formatted_sl = float(self.exchange.price_to_precision(ccxt_symbol, new_sl))
             sl_side = 'sell' if side == "LONG" else 'buy'
 
-            # Cancel the existing stop first (by id when known, else all —
-            # trail-managed positions only ever hold the one stop order).
+            # Cancel the existing algo stop first (by algoId when known,
+            # else all algo orders — trail-managed positions only ever hold
+            # the one stop). This is a SEPARATE order book from regular
+            # orders (Binance's Algo Order API), so the old cancel_order/
+            # cancel_all_orders calls silently missed it entirely.
             old_id = ctx.get("sl_order_id")
             if old_id:
                 try:
-                    await self.exchange.cancel_order(old_id, ccxt_symbol)
+                    await self._cancel_algo_order(ccxt_symbol, old_id)
                 except Exception as e:
-                    logger.warning(f"[{symbol}] Could not cancel old SL {old_id}: {e}")
+                    logger.warning(f"[{symbol}] Could not cancel old algo SL {old_id}: {e}")
             else:
                 try:
-                    await self.exchange.cancel_all_orders(ccxt_symbol)
+                    await self._cancel_all_algo_orders(ccxt_symbol)
                 except Exception as e:
-                    logger.warning(f"[{symbol}] cancel_all before stop move failed: {e}")
+                    logger.warning(f"[{symbol}] cancel_all_algo before stop move failed: {e}")
 
             live_qty = ctx.get("quantity") or 0
             try:
@@ -603,15 +651,12 @@ class ExecutionEngine:
                 logger.warning(f"[{symbol}] Could not fetch live position size for stop "
                                 f"move; using locally tracked quantity: {e}")
 
-            sl_order = await self.exchange.create_order(
-                symbol=ccxt_symbol,
-                type='STOP_MARKET',
-                side=sl_side,
-                amount=live_qty,
-                params={'stopPrice': formatted_sl, 'reduceOnly': True}
+            sl_algo = await self._create_algo_conditional(
+                ccxt_symbol, side=sl_side, order_type='STOP_MARKET',
+                amount=live_qty, stop_price=formatted_sl, reduce_only=True,
             )
             ctx["sl_price"] = formatted_sl
-            ctx["sl_order_id"] = sl_order.get('id')
+            ctx["sl_order_id"] = sl_algo.get('algoId')
             self.position_context[symbol] = ctx
             logger.info(f"[{symbol}] Trailing stop moved to {formatted_sl}.")
             config.send_log_to_dashboard(
