@@ -386,7 +386,13 @@ class ExecutionEngine:
             )
             logger.info(f"[{symbol}] ENTRY EXECUTED: {entry_order['id']} at {entry_order.get('average', current_price)}")
 
-            # Disaster Stop Loss (always closes the WHOLE position if hit).
+            # Disaster Stop Loss. reduceOnly + explicit quantity, NOT
+            # closePosition=True: Binance now rejects closePosition STOP_MARKET
+            # on the standard order endpoint (-4120 "use the Algo Order API
+            # instead"), which left a live position with NO stop order at all
+            # on 2026-07-22 (XMRUSDT). reduceOnly caps the fill at whatever
+            # position remains open (never reverses it), so a stale qty after
+            # a later partial de-risk still closes the position fully.
             sl_order = await self.exchange.create_order(
                 symbol=ccxt_symbol,
                 type='STOP_MARKET',
@@ -394,7 +400,7 @@ class ExecutionEngine:
                 amount=qty,
                 params={
                     'stopPrice': formatted_sl_price,
-                    'closePosition': True
+                    'reduceOnly': True,
                 }
             )
             logger.info(f"[{symbol}] SL PLACED: {sl_order['id']} at {formatted_sl_price}")
@@ -465,12 +471,15 @@ class ExecutionEngine:
                     )
             else:
                 # Fallback: single full-size take-profit (original behaviour).
+                # reduceOnly + explicit qty, not closePosition=True — see the
+                # SL comment above for why (Binance -4120 on the standard
+                # order endpoint).
                 tp_order = await self.exchange.create_order(
                     symbol=ccxt_symbol,
                     type='TAKE_PROFIT_MARKET',
                     side=sl_side,
                     amount=qty,
-                    params={'stopPrice': formatted_tp_price, 'closePosition': True}
+                    params={'stopPrice': formatted_tp_price, 'reduceOnly': True}
                 )
                 logger.info(f"[{symbol}] TP (full) at {formatted_tp_price}")
 
@@ -545,8 +554,9 @@ class ExecutionEngine:
         """Move the exchange stop order for an open position (trailing ratchet).
 
         Only ever tightens: a long's stop moves UP, a short's moves DOWN. The
-        old STOP_MARKET is cancelled and a fresh closePosition stop is placed
-        at the new level.
+        old STOP_MARKET is cancelled and a fresh reduceOnly stop is placed at
+        the new level, sized to the LIVE exchange position (not the locally
+        tracked quantity, which can go stale after a partial de-risk close).
         """
         if symbol not in self.active_positions:
             logger.info(f"[{symbol}] Stop update ignored: no active position.")
@@ -582,12 +592,23 @@ class ExecutionEngine:
                 except Exception as e:
                     logger.warning(f"[{symbol}] cancel_all before stop move failed: {e}")
 
+            live_qty = ctx.get("quantity") or 0
+            try:
+                positions = await self.exchange.fetch_positions([ccxt_symbol])
+                for pos in positions:
+                    if self._normalize_symbol(pos['symbol']) == symbol:
+                        live_qty = abs(float(pos.get('contracts', 0) or 0)) or live_qty
+                        break
+            except Exception as e:
+                logger.warning(f"[{symbol}] Could not fetch live position size for stop "
+                                f"move; using locally tracked quantity: {e}")
+
             sl_order = await self.exchange.create_order(
                 symbol=ccxt_symbol,
                 type='STOP_MARKET',
                 side=sl_side,
-                amount=ctx.get("quantity") or 0,
-                params={'stopPrice': formatted_sl, 'closePosition': True}
+                amount=live_qty,
+                params={'stopPrice': formatted_sl, 'reduceOnly': True}
             )
             ctx["sl_price"] = formatted_sl
             ctx["sl_order_id"] = sl_order.get('id')
@@ -659,7 +680,10 @@ class ExecutionEngine:
                 amount=qty, params={'reduceOnly': True}
             )
             logger.info(f"[{symbol}] De-risked {qty} ({fraction:.0%} of {live_qty}) at market. "
-                        f"closePosition=True stop/trailing orders auto-adjust to the new size.")
+                        f"The reduceOnly stop still fully closes whatever remains when it "
+                        f"triggers (reduceOnly caps the fill at the live position size), and "
+                        f"apply_stop_update refreshes the stop's quantity from the live "
+                        f"position on every trailing ratchet.")
 
             ctx = self.position_context.get(symbol)
             if ctx:
