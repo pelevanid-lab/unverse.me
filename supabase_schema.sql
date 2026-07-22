@@ -127,3 +127,48 @@ create table if not exists public.learning_state (
     state       jsonb,
     updated_at  timestamptz not null default now()
 );
+
+-- 10) Dashboard read (+ approve/reject write) access for the PUBLIC/
+--     publishable key (unverse-dashboard/src/utils/supabase/client.ts).
+--     The backend (execution_engine, htf_agent, learning_agent, ...) uses
+--     the SECRET key, which bypasses RLS entirely -- that is why the bot ran
+--     fine while the dashboard showed nothing: every one of these tables had
+--     RLS enabled with no permissive policy for the public key, so
+--     PostgREST silently returned 200 OK / zero rows for every query
+--     (2026-07-22 diagnosis). The Telegram chat-ID check in page.tsx is a
+--     client-side UX gate only -- it does NOT protect this data, since the
+--     public key is baked into the shipped JS bundle and works from any
+--     plain HTTP client. Anyone with that key can already read/approve
+--     signals directly against the REST API. If that's not acceptable,
+--     the real fix is server-side auth (a Next.js API route that checks the
+--     Telegram identity before touching Supabase), not tighter RLS -- these
+--     policies just restore the dashboard to working as designed.
+alter table public.agent_logs      enable row level security;
+alter table public.active_trades   enable row level security;
+alter table public.trade_history   enable row level security;
+alter table public.wallets         enable row level security;
+alter table public.pending_signals enable row level security;
+alter table public.narrative_trends enable row level security;
+
+drop policy if exists "dashboard read" on public.agent_logs;
+create policy "dashboard read" on public.agent_logs for select using (true);
+
+drop policy if exists "dashboard read" on public.active_trades;
+create policy "dashboard read" on public.active_trades for select using (true);
+
+drop policy if exists "dashboard read" on public.trade_history;
+create policy "dashboard read" on public.trade_history for select using (true);
+
+drop policy if exists "dashboard read" on public.wallets;
+create policy "dashboard read" on public.wallets for select using (true);
+
+drop policy if exists "dashboard read" on public.narrative_trends;
+create policy "dashboard read" on public.narrative_trends for select using (true);
+
+-- pending_signals additionally needs UPDATE: the dashboard's own
+-- Approve/Reject buttons (handleApprove/handleReject in page.tsx) write
+-- status directly, separately from Telegram's approve/reject flow.
+drop policy if exists "dashboard read" on public.pending_signals;
+create policy "dashboard read" on public.pending_signals for select using (true);
+drop policy if exists "dashboard approve reject" on public.pending_signals;
+create policy "dashboard approve reject" on public.pending_signals for update using (true) with check (true);
