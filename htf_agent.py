@@ -92,6 +92,48 @@ class HTFAgent:
         logger.info(f"Connecting to Redis at {config.REDIS_URL}")
         self.redis_client = redis.from_url(config.REDIS_URL, decode_responses=False)
         await self.exchange.load_markets()
+        await self._restore_cooldowns()
+
+    async def _restore_cooldowns(self):
+        """Restore last_signal_ts (per-symbol dispatch cooldown) from
+        Supabase pending_signals on startup.
+
+        last_eval_candle/last_signal_ts live only in memory, so EVERY
+        restart (a routine redeploy included) used to wipe them — the very
+        next scan then treated every symbol as "never evaluated" and
+        RE-DISPATCHED whatever daily/3-day candle was still current, even
+        though it had already been sent (and possibly approved/executed)
+        hours earlier. This is exactly what happened on 2026-07-22: a
+        redeploy restart caused XMRUSDT and LABUSDT to be dispatched a
+        second time. Restoring the cooldown timestamp is enough to close
+        the gap — it doesn't matter that last_eval_candle itself isn't
+        restored, since HTF_SIGNAL_COOLDOWN_HOURS blocks the re-dispatch
+        regardless of whether the candle gets re-evaluated.
+        """
+        if not config.supabase:
+            return
+        try:
+            def _fetch():
+                return config.supabase.table("pending_signals") \
+                    .select("symbol,created_at") \
+                    .order("created_at", desc=True).limit(500).execute()
+            res = await asyncio.to_thread(_fetch)
+            from datetime import datetime
+            restored = 0
+            for row in (res.data or []):
+                symbol = row.get("symbol")
+                if not symbol or symbol in self.last_signal_ts:
+                    continue  # keep the most recent (rows are newest-first)
+                try:
+                    ts = datetime.fromisoformat(
+                        str(row["created_at"]).replace("Z", "+00:00")).timestamp() * 1000
+                except Exception:
+                    continue
+                self.last_signal_ts[symbol] = ts
+                restored += 1
+            logger.info(f"Restored dispatch cooldown for {restored} symbol(s) from Supabase.")
+        except Exception as e:
+            logger.warning(f"Could not restore cooldown state (starting cold): {e}")
 
     async def cleanup(self):
         if self.redis_client:
